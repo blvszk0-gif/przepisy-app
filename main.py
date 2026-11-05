@@ -24,26 +24,41 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def ask_gemini_with_retry(prompt: str, max_retries: int = 4):
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    delays = [2, 5, 10, 15]
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
+def ask_groq_llama(prompt: str):
+    """Zapasowy silnik AI (Groq Llama 3.3 70B) z potężnym darmowym limitem."""
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "Jesteś kucharzem i tłumaczem. Zwracasz wyłącznie poprawny obiekt JSON zgodnie ze schematem, bez żadnego formatowania markdown ani zbędnych komentarzy."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"}
+    )
+    raw_text = response.choices[0].message.content.strip()
+    return json.loads(raw_text)
+
+def ask_ai_smart(prompt: str):
+    """Próbuje Gemini, a w razie błędu 429 lub przeciążenia natychmiast przełącza na Groq Llama."""
+    try:
+        if GEMINI_API_KEY:
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            res = client.models.generate_content(
                 model='gemini-3.8-flash',
                 contents=prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
-            return json.loads(response.text)
-        except Exception as e:
-            if ("503" in str(e) or "UNAVAILABLE" in str(e)) and attempt < max_retries - 1:
-                time.sleep(delays[attempt])
-                continue
-            raise e
+            return json.loads(res.text)
+    except Exception as e:
+        err_msg = str(e)
+        print(f"[Gemini niedostępne / 429 limit]: {err_msg}. Przełączam awaryjnie na Groq Llama 3.3 70B...")
+
+    # Zapasowy silnik AI (zawsze działa, nie wymaga czekania 8 godzin)
+    return ask_groq_llama(prompt)
 
 def process_recipe_by_id(recipe_id: str, url: str):
     try:
-        # KROK 1: Pobieranie opisu posta (bez pobierania wideo - zawsze działa w 100%)
+        # KROK 1: Pobieranie opisu i audio
         supabase.table("recipes").update({
             "status": "processing",
             "progress_step": 1,
@@ -53,22 +68,20 @@ def process_recipe_by_id(recipe_id: str, url: str):
         description = ""
         transcript_text = ""
 
-        # 1A. Bezpieczne wyciągnięcie tekstu opisu
+        # Pobranie samego opisu
         with yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True, 'socket_timeout': 15}) as ydl:
             info = ydl.extract_info(url, download=False)
             description = info.get('description', '') or ''
 
-        # Zapisujemy opis w bazie już teraz, by nie przepadł
         supabase.table("recipes").update({
             "original_description": description,
             "progress_step": 2,
             "progress_text": "Pobieranie i transkrypcja mowy (Whisper)..."
         }).eq("id", recipe_id).execute()
 
-        # 1B. Bezpieczne pobranie strumienia multimedialnego (BEZ postprocessorów ffprobe)
+        # Pobranie audio i transkrypcja
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                # Wybieramy najlżejszy strumień zawierający dźwięk lub małe wideo
                 ydl_opts = {
                     'format': 'ba/b[height<=480]/b/worst',
                     'outtmpl': f'{temp_dir}/media.%(ext)s',
@@ -83,7 +96,6 @@ def process_recipe_by_id(recipe_id: str, url: str):
                 downloaded_files = glob.glob(f"{temp_dir}/*")
                 if downloaded_files and GROQ_API_KEY:
                     media_file = downloaded_files[0]
-                    # Groq natywnie obsługuje mp4, m4a, mp3 bez potrzeby konwersji
                     groq_client = Groq(api_key=GROQ_API_KEY)
                     with open(media_file, "rb") as f:
                         transcription = groq_client.audio.transcriptions.create(
@@ -91,42 +103,41 @@ def process_recipe_by_id(recipe_id: str, url: str):
                             model="whisper-large-v3"
                         )
                     transcript_text = transcription.text.strip()
-                    print(f"Pomyślna transkrypcja: {transcript_text[:50]}...")
+                    print(f"Pomyślna transkrypcja Whisper: {transcript_text[:50]}...")
         except Exception as audio_err:
-            print(f"Pominięto audio (błąd odczytu lub brak mowy): {audio_err}")
-            transcript_text = "(Nie wykryto mowy w filmie lub audio niedostępne)"
+            print(f"Pominięto audio (błąd lub brak mowy): {audio_err}")
+            transcript_text = "(Nie wykryto mowy lub audio niedostępne)"
 
-        # KROK 3: Przetworzenie całości przez Gemini
+        # KROK 3: Przetworzenie całości (Gemini -> automatyczny fallback na Groq Llama)
         supabase.table("recipes").update({
             "progress_step": 3,
-            "progress_text": "Scalanie opisu i transkrypcji przez Gemini...",
+            "progress_text": "Scalanie opisu i transkrypcji przez AI...",
             "transcript": transcript_text
         }).eq("id", recipe_id).execute()
 
         prompt = f"""
-        Twoim zadaniem jest stworzyć kompletny przepis kulinarny łącząc DWA źródła:
-        
-        1. OPIS Z POSTA NA INSTAGRAMIE:
+        Stwórz kompletny przepis kulinarny łącząc dwa źródła:
+
+        1. OPIS Z POSTA:
         \"\"\"{description}\"\"\"
 
-        2. TRANSKRYPCJA MOWY Z WIDEO (Whisper):
+        2. TRANSKRYPCJA Z WIDEO:
         \"\"\"{transcript_text}\"\"\"
 
         Wytyczne:
-        - Jeśli opis zawiera składniki, a na wideo twórca podaje instrukcje lub odwrotnie – połącz wszystko w jedną spójną całość.
-        - Jeśli mowa jest niedostępna, opieraj się w 100% na opisie posta.
-        - Przetłumacz na język polski. Przelicz jednostki (uncje, cup na gramy/ml/łyżki).
-        - Zwróć wynik jako JSON:
+        - Połącz składniki i kroki w jedną całość. Jeśli audio nie ma mowy, oprzyj się w 100% na opisie.
+        - Przetłumacz wszystko na język polski. Przelicz jednostki (uncje, cup na gramy/ml/łyżki).
+        - Zwróć wynik jako obiekt JSON o strukturze:
         {{
             "title": "Tytuł dania",
-            "ingredients": [{{"name": "produkt i ilość", "category": "dział w sklepie (np. Warzywa, Nabiał, Przyprawy)"}}],
+            "ingredients": [{{"name": "produkt i ilość", "category": "dział w sklepie (np. Nabiał, Warzywa, Przyprawy)"}}],
             "instructions": ["krok 1", "krok 2"]
         }}
         """
 
-        recipe_data = ask_gemini_with_retry(prompt)
+        recipe_data = ask_ai_smart(prompt)
 
-        # KROK 4: Zapis gotowego dania w Supabase
+        # KROK 4: Zapis gotowego przepisu
         supabase.table("recipes").update({
             "title": recipe_data.get("title", "Przepis z Reels"),
             "ingredients": recipe_data.get("ingredients", []),
