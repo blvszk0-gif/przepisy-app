@@ -24,49 +24,65 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def get_best_groq_model(groq_client):
-    """Automatycznie dobiera najlepszy dostępny model na Twoim koncie Groq."""
-    preferred = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-70b-versatile",
+def ask_groq_ai(prompt: str):
+    """Zapasowy silnik AI z automatycznym testowaniem kolejnych modeli tekstowych."""
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    
+    # 1. Pobieramy listę modeli i odrzucamy modele audio/zewnętrzne
+    candidate_models = []
+    try:
+        models_data = groq_client.models.list().data
+        for m in models_data:
+            mid = m.id.lower()
+            # Odrzucamy modele z ukośnikiem (wymagające akceptacji licencji) i niemodelowe
+            if "/" in m.id or any(bad in mid for bad in ["whisper", "orpheus", "tts", "guard", "embed", "vision"]):
+                continue
+            candidate_models.append(m.id)
+    except Exception as e:
+        print(f"Błąd pobierania listy modeli Groq: {e}")
+
+    # Standardowa lista sprawdzonych modeli tekstowych Groq jako priorytety
+    priority_models = [
         "llama-3.1-8b-instant",
-        "llama3-70b-8192",
+        "llama-3.3-70b-versatile",
         "llama3-8b-8192",
+        "mixtral-8x7b-32768",
         "gemma2-9b-it"
     ]
-    try:
-        models = groq_client.models.list().data
-        available = [m.id for m in models if "whisper" not in m.id]
-        for p in preferred:
-            if p in available:
-                return p
-        if available:
-            return available[0]
-    except Exception as e:
-        print(f"Błąd sprawdzania listy modeli Groq: {e}")
-    return "llama-3.1-8b-instant"
+    
+    # Układamy ostateczną listę: najpierw znane modele, potem reszta wykrytych
+    final_models = [m for m in priority_models if m in candidate_models]
+    for m in candidate_models:
+        if m not in final_models:
+            final_models.append(m)
+    if not final_models:
+        final_models = priority_models
 
-def ask_groq_ai(prompt: str):
-    """Zapasowy silnik AI (Groq Llama) z bardzo wysokimi limitami dziennymi."""
-    groq_client = Groq(api_key=GROQ_API_KEY)
-    model_name = get_best_groq_model(groq_client)
-    print(f"Używam modelu Groq AI: {model_name}")
+    last_error = None
+    for model_name in final_models:
+        try:
+            print(f"Próbuję model Groq: {model_name}")
+            response = groq_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Jesteś kucharzem i tłumaczem. Zwracasz wyłącznie czysty obiekt JSON bez formatowania markdown."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"}
+            )
+            return json.loads(response.choices[0].message.content.strip())
+        except Exception as err:
+            print(f"Model {model_name} niedostępny ({err}). Próbuję kolejny...")
+            last_error = err
+            continue
 
-    response = groq_client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {
-                "role": "system",
-                "content": "Jesteś kucharzem i tłumaczem. Zwracasz wyłącznie czysty obiekt JSON bez formatowania markdown."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        response_format={"type": "json_object"}
-    )
-    return json.loads(response.choices[0].message.content.strip())
+    raise last_error or Exception("Żaden model Groq nie był w stanie przetworzyć zapytania.")
 
 def ask_ai_smart(prompt: str):
-    """Próbuje Gemini, a w razie blokady limitu natychmiast przełącza na Groq."""
+    """Próbuje Gemini, a w razie błędu 503 lub limitu 429 natychmiast przełącza na Groq."""
     try:
         if GEMINI_API_KEY:
             client = genai.Client(api_key=GEMINI_API_KEY)
@@ -77,13 +93,13 @@ def ask_ai_smart(prompt: str):
             )
             return json.loads(res.text)
     except Exception as e:
-        print(f"[Gemini niedostępne / limit]: {e}. Przełączam na silnik Groq Llama...")
+        print(f"[Gemini 503/429]: {e}. Przełączam na zapasowy silnik Groq...")
 
     return ask_groq_ai(prompt)
 
 def process_recipe_by_id(recipe_id: str, url: str):
     try:
-        # KROK 1: Pobieranie opisu
+        # KROK 1: Pobieranie opisu posta
         supabase.table("recipes").update({
             "status": "processing",
             "progress_step": 1,
@@ -92,11 +108,13 @@ def process_recipe_by_id(recipe_id: str, url: str):
 
         description = ""
         transcript_text = ""
+        available_formats = []
 
-        # Pobieranie samego opisu
+        # Ekstrakcja metadanych bez pobierania całego pliku
         with yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True, 'socket_timeout': 15}) as ydl:
             info = ydl.extract_info(url, download=False)
             description = info.get('description', '') or ''
+            available_formats = info.get('formats', [])
 
         supabase.table("recipes").update({
             "original_description": description,
@@ -104,16 +122,24 @@ def process_recipe_by_id(recipe_id: str, url: str):
             "progress_text": "Pobieranie audio i transkrypcja mowy (Whisper)..."
         }).eq("id", recipe_id).execute()
 
-        # Pobieranie strumienia z dźwiękiem (wymuszamy filtr acodec!=none)
+        # KROK 2: Wymuszenie formatu z wbudowanym audio (format '0' na Instagramie)
         try:
+            format_ids = [str(f.get('format_id')) for f in available_formats]
+            
+            # Wybieramy format '0' (mobilny MP4 z dźwiękiem) lub pierwszy format z audio
+            if '0' in format_ids:
+                chosen_format = '0'
+            else:
+                chosen_format = 'bestaudio/b[acodec!=none]/worst[acodec!=none]/worst'
+
             with tempfile.TemporaryDirectory() as temp_dir:
                 ydl_opts = {
-                    'format': 'bestaudio[acodec!=none]/best[acodec!=none]/worst[acodec!=none]/best',
+                    'format': chosen_format,
                     'outtmpl': f'{temp_dir}/media.%(ext)s',
                     'quiet': True,
                     'no_warnings': True,
                     'socket_timeout': 30,
-                    'max_filesize': 30 * 1024 * 1024,
+                    'max_filesize': 35 * 1024 * 1024,
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
@@ -128,7 +154,7 @@ def process_recipe_by_id(recipe_id: str, url: str):
                             model="whisper-large-v3"
                         )
                     transcript_text = transcription.text.strip()
-                    print(f"Transkrypcja udana: {transcript_text[:50]}...")
+                    print(f"Transkrypcja Whisper zakończona sukcesem ({len(transcript_text)} znaków)")
         except Exception as audio_err:
             print(f"Pominięto audio (brak mowy lub format nieobsługiwany): {audio_err}")
             transcript_text = "(Nie wykryto mowy w filmie)"
