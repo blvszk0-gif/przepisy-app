@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import tempfile
 import glob
 import time
@@ -25,45 +26,76 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def ask_groq_ai(prompt: str):
-    """Zapasowy silnik Groq z temperaturą 0.1 zapobiegającą pętlom i halucynacjom."""
+    """Zapasowy silnik AI pobierający wyłącznie aktywne modele z konta Groq."""
     groq_client = Groq(api_key=GROQ_API_KEY)
     
-    # Modele tekstowe w kolejności priorytetu
-    test_models = [
-        "llama-3.1-8b-instant",
-        "llama3-8b-8192",
-        "mixtral-8x7b-32768",
-        "gemma2-9b-it"
-    ]
-    
-    last_err = None
-    for model_name in test_models:
+    # 1. Pobranie aktualnie aktywnych modeli tekstowych
+    active_models = []
+    try:
+        models_data = groq_client.models.list().data
+        for m in models_data:
+            mid = m.id.lower()
+            is_active = getattr(m, 'active', True)
+            is_specialized = any(x in mid for x in ["whisper", "guard", "orpheus", "embed", "tts", "vision", "safetensors"])
+            if is_active and not is_specialized and "/" not in m.id:
+                active_models.append(m.id)
+    except Exception as e:
+        print(f"Błąd sprawdzania modeli Groq: {e}")
+
+    if not active_models:
+        active_models = ["llama-3.1-8b-instant"]
+
+    # Priorytetyzacja sprawdzonych modeli Llama
+    active_models.sort(key=lambda name: 0 if "llama-3.1-8b" in name else (1 if "llama-3.3" in name else 2))
+
+    for model_name in active_models:
+        # Próba 1: Tryb wymuszonego JSON
         try:
-            print(f"Używam silnika zapasowego Groq: {model_name}")
-            response = groq_client.chat.completions.create(
+            print(f"Uruchamiam model Groq: {model_name}")
+            resp = groq_client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {
                         "role": "system",
-                        "content": "Jesteś precyzyjnym asystentem kulinarnym. Odpowiadasz WYŁĄCZNIE poprawnym obiektem JSON zgodnie z zadaną strukturą. Bez komentarzy, bez markdown."
+                        "content": "Jesteś kucharzem i tłumaczem. Zwracasz WYŁĄCZNIE poprawny JSON bez żadnego dodatkowego tekstu."
                     },
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1,  # Eliminuje zapętlanie się i zmyślanie słów
+                temperature=0.1,
                 max_tokens=2048
             )
-            raw = response.choices[0].message.content.strip()
+            raw = resp.choices[0].message.content.strip()
             return json.loads(raw)
-        except Exception as err:
-            print(f"Model {model_name} błąd: {err}")
-            last_err = err
-            continue
+        except Exception as e1:
+            print(f"Model {model_name} (JSON mode) błąd: {e1}. Próba w trybie swobodnym...")
+            
+            # Próba 2: Tryb swobodny z ekstrakcją klamer regexem
+            try:
+                resp = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Zwróć przepis jako obiekt JSON: {\"title\": \"...\", \"ingredients\": [{\"name\": \"...\", \"category\": \"...\"}], \"instructions\": [\"...\"]}."
+                        },
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=2048
+                )
+                raw_text = resp.choices[0].message.content.strip()
+                match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                if match:
+                    return json.loads(match.group(0))
+            except Exception as e2:
+                print(f"Model {model_name} (tekst) błąd: {e2}")
+                continue
 
-    raise last_err or Exception("Brak dostępnego modelu w Groq")
+    raise Exception("Żaden z aktywnych modeli Groq nie przetworzył zapytania.")
 
 def ask_ai_smart(prompt: str):
-    """Próbuje Gemini (z ponawianiem przy 503), a w razie twardego limitu 429 przełącza na Groq."""
+    """Odpytuje Gemini (z ponawianiem przy 503), a w razie braku limitu przełącza na Groq."""
     if GEMINI_API_KEY:
         client = genai.Client(api_key=GEMINI_API_KEY)
         for attempt in range(3):
@@ -76,20 +108,18 @@ def ask_ai_smart(prompt: str):
                 return json.loads(res.text)
             except Exception as e:
                 err_msg = str(e)
-                # Chwilowe przeciążenie (503) - czekamy 3 sekundy i ponawiamy Gemini
                 if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < 2:
-                    print(f"[Gemini 503] Chwilowe przeciążenie. Próba {attempt+1}/3 za 3 sekundy...")
+                    print(f"[Gemini 503] Ponawiam próbę za 3s ({attempt+1}/3)...")
                     time.sleep(3)
                     continue
-                print(f"[Gemini błąd]: {err_msg}. Przełączam na Groq Llama...")
+                print(f"[Gemini błąd/limit]: {err_msg[:90]}. Przełączam na Groq...")
                 break
 
-    # Przełączenie awaryjne na Groq z zabezpieczoną temperaturą
     return ask_groq_ai(prompt)
 
 def process_recipe_by_id(recipe_id: str, url: str):
     try:
-        # KROK 1: Pobranie opisu i analiza strumieni wideo/audio
+        # KROK 1: Pobranie opisu i formatów
         supabase.table("recipes").update({
             "status": "processing",
             "progress_step": 1,
@@ -111,10 +141,9 @@ def process_recipe_by_id(recipe_id: str, url: str):
             "progress_text": "Pobieranie audio i transkrypcja mowy (Whisper)..."
         }).eq("id", recipe_id).execute()
 
-        # KROK 2: Sprawdzenie, który strumień NA PEWNO ma ścieżkę dźwiękową
+        # KROK 2: Weryfikacja obecności ścieżki dźwiękowej
         audio_stream_id = None
         for f in formats:
-            # Szukamy formatu z aktywnym kodekiem audio (różnym od 'none')
             if f.get('acodec') and f.get('acodec') != 'none':
                 audio_stream_id = str(f.get('format_id'))
                 break
@@ -143,15 +172,14 @@ def process_recipe_by_id(recipe_id: str, url: str):
                                 model="whisper-large-v3"
                             )
                         transcript_text = transcription.text.strip()
-                        print(f"Pomyślna transkrypcja Whisper: {transcript_text[:60]}...")
+                        print(f"Transkrypcja Whisper gotowa ({len(transcript_text)} znaków)")
             except Exception as audio_err:
-                print(f"Pominięto audio (błąd transkrypcji): {audio_err}")
+                print(f"Transkrypcja pominięta: {audio_err}")
                 transcript_text = "(Nie wykryto mowy w filmie)"
         else:
-            print("Rolka nie zawiera strumienia audio – opieram się wyłącznie na opisie.")
             transcript_text = "(Rolka bez ścieżki dźwiękowej)"
 
-        # KROK 3: Połączenie materiałów przez AI
+        # KROK 3: Przetworzenie całości przez AI
         supabase.table("recipes").update({
             "progress_step": 3,
             "progress_text": "Scalanie opisu i transkrypcji przez AI...",
@@ -159,21 +187,21 @@ def process_recipe_by_id(recipe_id: str, url: str):
         }).eq("id", recipe_id).execute()
 
         prompt = f"""
-        Stwórz kompletny, zwięzły przepis kulinarny w języku polskim łącząc dwa źródła:
+        Stwórz kompletny, zwięzły przepis kulinarny w języku polskim na podstawie danych:
 
-        ŹRÓDŁO 1 (Opis pod postem):
+        ŹRÓDŁO 1 (Opis posta na Instagramie):
         \"\"\"{description}\"\"\"
 
         ŹRÓDŁO 2 (Mowa twórcy z nagrania):
         \"\"\"{transcript_text}\"\"\"
 
-        Zasady:
-        - Jeśli w jednym źródle są składniki, a w drugim wskazówki – połącz je w spójną całość.
-        - Przelicz jednostki (np. uncje/cups na gramy, ml, łyżki).
-        - Zwróć WYŁĄCZNIE czysty JSON o strukturze:
+        Wytyczne:
+        - Połącz składniki i proporcje z obu źródeł w spójną całość.
+        - Przetłumacz na polski i przelicz jednostki (uncje, cup na gramy/ml/łyżki).
+        - Zwróć wyłącznie JSON o strukturze:
         {{
             "title": "Dokładny tytuł dania po polsku",
-            "ingredients": [{{"name": "nazwa i ilość produktu", "category": "dział w markecie"}}],
+            "ingredients": [{{"name": "nazwa i ilość produktu", "category": "dział w sklepie"}}],
             "instructions": ["Krok 1 przygotowania", "Krok 2 przygotowania"]
         }}
         """
@@ -191,10 +219,9 @@ def process_recipe_by_id(recipe_id: str, url: str):
             "transcript": transcript_text,
             "original_description": description
         }).eq("id", recipe_id).execute()
-        print(f"Przepis {recipe_id} pomyślnie zapisany!")
 
     except Exception as err:
-        print(f"Krytyczny błąd dla {recipe_id}: {err}")
+        print(f"Błąd dla przepisu {recipe_id}: {err}")
         if supabase:
             supabase.table("recipes").update({
                 "status": "error",
