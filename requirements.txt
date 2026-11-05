@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+yt-dlp
+groq
+google-genai
+supabase
+python-multipart
+jinja2
+pydantic

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moje Przepisy z Reels</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .checked-item { text-decoration: line-through; color: #9ca3af; }
+    </style>
+</head>
+<body class="bg-gray-50 p-4 md:p-8 font-sans">
+    <div class="max-w-2xl mx-auto">
+        <h1 class="text-3xl font-bold text-gray-800 mb-6">Zapisane Przepisy 👩‍🍳</h1>
+        
+        <!-- Formularz dodawania nowego linku -->
+        <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-8">
+            <form id="urlForm" class="flex flex-col gap-3">
+                <input type="url" id="ig_url" name="url" placeholder="Wklej link do Instagram Reels..." required
+                    class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-400 outline-none">
+                <button type="submit" id="submitBtn" class="bg-blue-600 text-white font-semibold py-3 rounded-lg hover:bg-blue-700 transition">
+                    Pobierz i przetłumacz przepis
+                </button>
+            </form>
+            <div id="loading" class="hidden mt-4 text-blue-600 font-medium text-center animate-pulse">
+                Magia się dzieje... Pobieram wideo, spisuję tekst i tłumaczę. To potrwa kilkanaście sekund ⏳
+            </div>
+        </div>
+
+        <!-- Lista przepisów z bazy danych -->
+        <div class="space-y-6">
+            {% for recipe in recipes %}
+            <div class="bg-white p-5 rounded-xl shadow-sm border border-gray-100">
+                <h2 class="text-2xl font-bold text-gray-800 mb-2">{{ recipe.title }}</h2>
+                <a href="{{ recipe.source_url }}" target="_blank" class="text-blue-500 text-sm mb-4 inline-block hover:underline">🔗 Zobacz oryginalną rolkę</a>
+                
+                <h3 class="text-lg font-semibold text-gray-700 mt-4 mb-2">🛒 Lista zakupów:</h3>
+                <div class="space-y-2 mb-6">
+                    {% for item in recipe.ingredients %}
+                    <label class="flex items-center gap-3 p-2 bg-gray-50 rounded-lg cursor-pointer hover:bg-gray-100 transition">
+                        <input type="checkbox" class="w-5 h-5 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                               onchange="this.nextElementSibling.classList.toggle('checked-item')">
+                        <span class="text-gray-700 select-none">
+                            <span class="font-medium">[{{ item.category }}]</span> {{ item.name }}
+                        </span>
+                    </label>
+                    {% endfor %}
+                </div>
+
+                <h3 class="text-lg font-semibold text-gray-700 mb-2">🧑‍🍳 Przygotowanie:</h3>
+                <ol class="list-decimal pl-5 space-y-2 text-gray-700">
+                    {% for step in recipe.instructions %}
+                    <li>{{ step }}</li>
+                    {% endfor %}
+                </ol>
+            </div>
+            {% else %}
+            <p class="text-gray-500 text-center py-8">Brak zapisanych przepisów. Dodaj pierwszy link powyżej!</p>
+            {% endfor %}
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('urlForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('submitBtn');
+            const loading = document.getElementById('loading');
+            
+            btn.disabled = true;
+            btn.classList.add('opacity-50');
+            loading.classList.remove('hidden');
+
+            const formData = new FormData();
+            formData.append('url', document.getElementById('ig_url').value);
+
+            try {
+                const response = await fetch('/process', { method: 'POST', body: formData });
+                const result = await response.json();
+                if(result.status === 'success') {
+                    window.location.reload(); // Odświeża stronę, aby pokazać nowy przepis z bazy
+                } else {
+                    alert('Błąd przetwarzania: ' + result.message);
+                }
+            } catch (error) {
+                alert('Wystąpił błąd połączenia.');
+            } finally {
+                btn.disabled = false;
+                btn.classList.remove('opacity-50');
+                loading.classList.add('hidden');
+                document.getElementById('ig_url').value = '';
+            }
+        });
+    </script>
+</body>
+</html>
