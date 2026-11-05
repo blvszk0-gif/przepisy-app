@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request, Form, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 import yt_dlp
+import imageio_ffmpeg
 from groq import Groq
 from google import genai
 from google.genai import types
@@ -14,6 +15,12 @@ from supabase import create_client, Client
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
+
+# Konfiguracja ścieżki do wbudowanego FFmpeg dla całego systemu
+ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+if ffmpeg_dir not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = f"{ffmpeg_dir}:{os.environ.get('PATH', '')}"
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -42,13 +49,12 @@ def ask_gemini_with_retry(prompt: str, max_retries: int = 4):
             raise e
 
 def process_recipe_by_id(recipe_id: str, url: str):
-    """Zawsze pobiera zarówno opis posta, jak i audio do transkrypcji Whisper."""
     try:
-        # KROK 1: Pobieranie opisu i pliku audio
+        # KROK 1: Pobieranie opisu oraz ekstrakcja audio do MP3
         supabase.table("recipes").update({
             "status": "processing",
             "progress_step": 1,
-            "progress_text": "Pobieranie opisu posta i ścieżki dźwiękowej..."
+            "progress_text": "Pobieranie opisu i wycinanie ścieżki audio MP3..."
         }).eq("id", recipe_id).execute()
 
         description = ""
@@ -56,27 +62,35 @@ def process_recipe_by_id(recipe_id: str, url: str):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             ydl_opts = {
-                'format': 'ba/b',
+                'ffmpeg_location': ffmpeg_exe,
+                'format': 'bestaudio/best[acodec!=none]/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '128',
+                }],
                 'outtmpl': f'{temp_dir}/audio.%(ext)s',
                 'quiet': True,
                 'no_warnings': True,
                 'socket_timeout': 30,
-                'max_filesize': 40 * 1024 * 1024,
+                'max_filesize': 50 * 1024 * 1024,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 description = info.get('description', '') or ''
 
-            # KROK 2: Transkrypcja mowy twórcy
+            # KROK 2: Transkrypcja mowy z czystego pliku MP3
             supabase.table("recipes").update({
                 "progress_step": 2,
                 "progress_text": "Transkrypcja mowy twórcy przez Whisper...",
                 "original_description": description
             }).eq("id", recipe_id).execute()
 
-            downloaded_files = glob.glob(f"{temp_dir}/*")
-            if downloaded_files and GROQ_API_KEY:
-                media_file = downloaded_files[0]
+            # Szukamy wygenerowanego pliku MP3
+            mp3_files = glob.glob(f"{temp_dir}/*.mp3")
+            media_file = mp3_files[0] if mp3_files else (glob.glob(f"{temp_dir}/*") or [None])[0]
+
+            if media_file and GROQ_API_KEY:
                 try:
                     groq_client = Groq(api_key=GROQ_API_KEY)
                     with open(media_file, "rb") as f:
@@ -85,33 +99,34 @@ def process_recipe_by_id(recipe_id: str, url: str):
                             model="whisper-large-v3"
                         )
                     transcript_text = transcription.text
+                    print(f"Transkrypcja udana ({len(transcript_text)} znaków): {transcript_text[:60]}...")
                 except Exception as audio_err:
-                    print(f"Błąd transkrypcji: {audio_err}")
-                    transcript_text = "(Nie wykryto mowy lub błąd formatu audio)"
+                    print(f"Błąd transkrypcji Groq: {audio_err}")
+                    transcript_text = "(Twórca nie mówił w filmie lub błąd audio)"
 
-        # KROK 3: Łączenie opisu i transkrypcji przez Gemini
+        # KROK 3: Łączenie opisu posta i transkrypcji audio przez Gemini
         supabase.table("recipes").update({
             "progress_step": 3,
-            "progress_text": "Scalanie opisu i transkrypcji w przepis...",
+            "progress_text": "Scalanie opisu posta i transkrypcji audio...",
             "transcript": transcript_text
         }).eq("id", recipe_id).execute()
 
         prompt = f"""
         Twoim zadaniem jest stworzyć kompletny przepis kulinarny łącząc DWA źródła:
         
-        1. OPIS Z POSTA (Instagram Caption):
+        1. OPIS Z POSTA NA INSTAGRAMIE:
         \"\"\"{description}\"\"\"
 
-        2. TRANSKRYPCJA DŹWIĘKU Z WIDEO (Mowa twórcy):
+        2. TRANSKRYPCJA MOWY Z WIDEO (Whisper):
         \"\"\"{transcript_text}\"\"\"
 
         Wytyczne:
-        - Połącz składniki z obu źródeł (jeśli w opisie są proporcje, a na wideo triki i temperatury, uwzględnij wszystko).
-        - Przetłumacz na język polski. Przelicz jednostki (uncje, cup itp. na gramy/ml/łyżki).
+        - Jeśli w opisie są proporcje, a na filmie twórca mówi o temperaturach, czasie smażenia lub trikach – połącz wszystko w jedną całość.
+        - Przetłumacz na język polski. Przelicz jednostki (uncje, cup na gramy/ml/łyżki).
         - Zwróć wynik jako JSON:
         {{
             "title": "Tytuł dania",
-            "ingredients": [{{"name": "produkt i ilość", "category": "dział w sklepie (np. Nabiał, Warzywa, Przyprawy)"}}],
+            "ingredients": [{{"name": "produkt i ilość", "category": "dział w sklepie (np. Warzywa, Nabiał, Przyprawy)"}}],
             "instructions": ["krok 1", "krok 2"]
         }}
         """
@@ -152,7 +167,6 @@ def read_root(request: Request):
 
 @app.get("/api/queue")
 def get_queue_api():
-    """Zwraca wszystkie trwające i nieudane zadania do podglądu na żywo."""
     if supabase:
         res = supabase.table("recipes").select("*").neq("status", "completed").order("created_at", desc=True).execute()
         return res.data or []
