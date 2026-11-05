@@ -7,20 +7,17 @@ from fastapi import FastAPI, Request, Form, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 import yt_dlp
-import imageio_ffmpeg
+import static_ffmpeg
 from groq import Groq
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
 
+# Dodanie pełnego ffmpeg oraz ffprobe do systemowego PATH
+static_ffmpeg.add_paths()
+
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
-
-# Konfiguracja ścieżki do wbudowanego FFmpeg dla całego systemu
-ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-ffmpeg_dir = os.path.dirname(ffmpeg_exe)
-if ffmpeg_dir not in os.environ.get("PATH", ""):
-    os.environ["PATH"] = f"{ffmpeg_dir}:{os.environ.get('PATH', '')}"
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -50,7 +47,7 @@ def ask_gemini_with_retry(prompt: str, max_retries: int = 4):
 
 def process_recipe_by_id(recipe_id: str, url: str):
     try:
-        # KROK 1: Pobieranie opisu oraz ekstrakcja audio do MP3
+        # KROK 1: Pobieranie opisu oraz konwersja do MP3
         supabase.table("recipes").update({
             "status": "processing",
             "progress_step": 1,
@@ -62,8 +59,7 @@ def process_recipe_by_id(recipe_id: str, url: str):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             ydl_opts = {
-                'ffmpeg_location': ffmpeg_exe,
-                'format': 'bestaudio/best[acodec!=none]/best',
+                'format': 'bestaudio/best',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
@@ -79,14 +75,13 @@ def process_recipe_by_id(recipe_id: str, url: str):
                 info = ydl.extract_info(url, download=True)
                 description = info.get('description', '') or ''
 
-            # KROK 2: Transkrypcja mowy z czystego pliku MP3
+            # KROK 2: Transkrypcja mowy twórcy
             supabase.table("recipes").update({
                 "progress_step": 2,
                 "progress_text": "Transkrypcja mowy twórcy przez Whisper...",
                 "original_description": description
             }).eq("id", recipe_id).execute()
 
-            # Szukamy wygenerowanego pliku MP3
             mp3_files = glob.glob(f"{temp_dir}/*.mp3")
             media_file = mp3_files[0] if mp3_files else (glob.glob(f"{temp_dir}/*") or [None])[0]
 
@@ -99,12 +94,11 @@ def process_recipe_by_id(recipe_id: str, url: str):
                             model="whisper-large-v3"
                         )
                     transcript_text = transcription.text
-                    print(f"Transkrypcja udana ({len(transcript_text)} znaków): {transcript_text[:60]}...")
                 except Exception as audio_err:
                     print(f"Błąd transkrypcji Groq: {audio_err}")
-                    transcript_text = "(Twórca nie mówił w filmie lub błąd audio)"
+                    transcript_text = "(Nie wykryto mowy w filmie)"
 
-        # KROK 3: Łączenie opisu posta i transkrypcji audio przez Gemini
+        # KROK 3: Łączenie opisu i transkrypcji przez Gemini
         supabase.table("recipes").update({
             "progress_step": 3,
             "progress_text": "Scalanie opisu posta i transkrypcji audio...",
@@ -121,7 +115,7 @@ def process_recipe_by_id(recipe_id: str, url: str):
         \"\"\"{transcript_text}\"\"\"
 
         Wytyczne:
-        - Jeśli w opisie są proporcje, a na filmie twórca mówi o temperaturach, czasie smażenia lub trikach – połącz wszystko w jedną całość.
+        - Połącz składniki i wskazówki z obu źródeł w jeden pełny przepis. Jeśli nie ma mowy, oprzyj się w 100% na opisie.
         - Przetłumacz na język polski. Przelicz jednostki (uncje, cup na gramy/ml/łyżki).
         - Zwróć wynik jako JSON:
         {{
@@ -202,7 +196,7 @@ def process_reels(background_tasks: BackgroundTasks, url: str = Form(...)):
 @app.post("/retry/{recipe_id}")
 def retry_recipe(recipe_id: str, background_tasks: BackgroundTasks):
     if not supabase:
-        return JSONResponse(status_code=500, content={"message": "Błąd bazy"})
+        return JSONResponse(status_code=500, content={"message": "Brak bazy"})
 
     res = supabase.table("recipes").select("*").eq("id", recipe_id).execute()
     if not res.data:
