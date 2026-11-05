@@ -7,14 +7,10 @@ from fastapi import FastAPI, Request, Form, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 import yt_dlp
-import static_ffmpeg
 from groq import Groq
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
-
-# Dodanie pełnego ffmpeg oraz ffprobe do systemowego PATH
-static_ffmpeg.add_paths()
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -47,61 +43,63 @@ def ask_gemini_with_retry(prompt: str, max_retries: int = 4):
 
 def process_recipe_by_id(recipe_id: str, url: str):
     try:
-        # KROK 1: Pobieranie opisu oraz konwersja do MP3
+        # KROK 1: Pobieranie opisu posta (bez pobierania wideo - zawsze działa w 100%)
         supabase.table("recipes").update({
             "status": "processing",
             "progress_step": 1,
-            "progress_text": "Pobieranie opisu i wycinanie ścieżki audio MP3..."
+            "progress_text": "Pobieranie opisu posta i multimediów..."
         }).eq("id", recipe_id).execute()
 
         description = ""
         transcript_text = ""
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '128',
-                }],
-                'outtmpl': f'{temp_dir}/audio.%(ext)s',
-                'quiet': True,
-                'no_warnings': True,
-                'socket_timeout': 30,
-                'max_filesize': 50 * 1024 * 1024,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                description = info.get('description', '') or ''
+        # 1A. Bezpieczne wyciągnięcie tekstu opisu
+        with yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True, 'socket_timeout': 15}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            description = info.get('description', '') or ''
 
-            # KROK 2: Transkrypcja mowy twórcy
-            supabase.table("recipes").update({
-                "progress_step": 2,
-                "progress_text": "Transkrypcja mowy twórcy przez Whisper...",
-                "original_description": description
-            }).eq("id", recipe_id).execute()
+        # Zapisujemy opis w bazie już teraz, by nie przepadł
+        supabase.table("recipes").update({
+            "original_description": description,
+            "progress_step": 2,
+            "progress_text": "Pobieranie i transkrypcja mowy (Whisper)..."
+        }).eq("id", recipe_id).execute()
 
-            mp3_files = glob.glob(f"{temp_dir}/*.mp3")
-            media_file = mp3_files[0] if mp3_files else (glob.glob(f"{temp_dir}/*") or [None])[0]
+        # 1B. Bezpieczne pobranie strumienia multimedialnego (BEZ postprocessorów ffprobe)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Wybieramy najlżejszy strumień zawierający dźwięk lub małe wideo
+                ydl_opts = {
+                    'format': 'ba/b[height<=480]/b/worst',
+                    'outtmpl': f'{temp_dir}/media.%(ext)s',
+                    'quiet': True,
+                    'no_warnings': True,
+                    'socket_timeout': 30,
+                    'max_filesize': 30 * 1024 * 1024,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
 
-            if media_file and GROQ_API_KEY:
-                try:
+                downloaded_files = glob.glob(f"{temp_dir}/*")
+                if downloaded_files and GROQ_API_KEY:
+                    media_file = downloaded_files[0]
+                    # Groq natywnie obsługuje mp4, m4a, mp3 bez potrzeby konwersji
                     groq_client = Groq(api_key=GROQ_API_KEY)
                     with open(media_file, "rb") as f:
                         transcription = groq_client.audio.transcriptions.create(
                             file=(os.path.basename(media_file), f.read()),
                             model="whisper-large-v3"
                         )
-                    transcript_text = transcription.text
-                except Exception as audio_err:
-                    print(f"Błąd transkrypcji Groq: {audio_err}")
-                    transcript_text = "(Nie wykryto mowy w filmie)"
+                    transcript_text = transcription.text.strip()
+                    print(f"Pomyślna transkrypcja: {transcript_text[:50]}...")
+        except Exception as audio_err:
+            print(f"Pominięto audio (błąd odczytu lub brak mowy): {audio_err}")
+            transcript_text = "(Nie wykryto mowy w filmie lub audio niedostępne)"
 
-        # KROK 3: Łączenie opisu i transkrypcji przez Gemini
+        # KROK 3: Przetworzenie całości przez Gemini
         supabase.table("recipes").update({
             "progress_step": 3,
-            "progress_text": "Scalanie opisu posta i transkrypcji audio...",
+            "progress_text": "Scalanie opisu i transkrypcji przez Gemini...",
             "transcript": transcript_text
         }).eq("id", recipe_id).execute()
 
@@ -115,7 +113,8 @@ def process_recipe_by_id(recipe_id: str, url: str):
         \"\"\"{transcript_text}\"\"\"
 
         Wytyczne:
-        - Połącz składniki i wskazówki z obu źródeł w jeden pełny przepis. Jeśli nie ma mowy, oprzyj się w 100% na opisie.
+        - Jeśli opis zawiera składniki, a na wideo twórca podaje instrukcje lub odwrotnie – połącz wszystko w jedną spójną całość.
+        - Jeśli mowa jest niedostępna, opieraj się w 100% na opisie posta.
         - Przetłumacz na język polski. Przelicz jednostki (uncje, cup na gramy/ml/łyżki).
         - Zwróć wynik jako JSON:
         {{
@@ -127,7 +126,7 @@ def process_recipe_by_id(recipe_id: str, url: str):
 
         recipe_data = ask_gemini_with_retry(prompt)
 
-        # KROK 4: Zapis gotowego przepisu
+        # KROK 4: Zapis gotowego dania w Supabase
         supabase.table("recipes").update({
             "title": recipe_data.get("title", "Przepis z Reels"),
             "ingredients": recipe_data.get("ingredients", []),
