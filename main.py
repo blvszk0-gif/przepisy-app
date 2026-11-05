@@ -45,6 +45,33 @@ def ask_gemini_with_retry(prompt: str, max_retries: int = 4):
                 continue
             raise e
 
+def extract_audio_and_transcribe(url: str):
+    """Pomocnicza funkcja pobierająca sam dźwięk i robiąca transkrypcję w Groq."""
+    transcript_text = ""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ydl_opts_audio = {
+            'format': 'ba/b',
+            'outtmpl': f'{temp_dir}/audio.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            'socket_timeout': 25,
+            'max_filesize': 35 * 1024 * 1024,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts_audio) as ydl:
+            ydl.download([url])
+
+        downloaded_files = glob.glob(f"{temp_dir}/*")
+        if downloaded_files and GROQ_API_KEY:
+            media_file = downloaded_files[0]
+            groq_client = Groq(api_key=GROQ_API_KEY)
+            with open(media_file, "rb") as f:
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(os.path.basename(media_file), f.read()),
+                    model="whisper-large-v3"
+                )
+            transcript_text = transcription.text
+    return transcript_text
+
 def process_recipe_by_id(recipe_id: str, url: str):
     try:
         description = ""
@@ -59,12 +86,16 @@ def process_recipe_by_id(recipe_id: str, url: str):
             description = info.get('description', '') or ''
 
         recipe_data = None
+        has_transcript = False
+        transcript_text = ""
+
+        # KROK A: Szybka próba z samego opisu
         if len(description.strip()) > 40:
             prompt_check = f"""
             Przeanalizuj opis z rolki kulinarnej:
             \"\"\"{description}\"\"\"
 
-            Czy ten opis zawiera składniki ORAZ kroki przygotowania dania?
+            Czy ten opis zawiera dokładne składniki ORAZ kroki przygotowania dania?
             Jeśli TAK, przetłumacz na polski i zwróć JSON:
             {{
                 "has_recipe": true,
@@ -81,38 +112,19 @@ def process_recipe_by_id(recipe_id: str, url: str):
             except Exception as e:
                 print(f"Błąd analizy tekstu opisu: {e}")
 
+        # KROK B: Jeśli brak pełnego przepisu w opisie -> pobieramy dźwięk
         if not recipe_data:
-            transcript_text = ""
-            with tempfile.TemporaryDirectory() as temp_dir:
-                ydl_opts_audio = {
-                    'format': 'ba/b',
-                    'outtmpl': f'{temp_dir}/audio.%(ext)s',
-                    'quiet': True,
-                    'no_warnings': True,
-                    'socket_timeout': 20,
-                    'max_filesize': 35 * 1024 * 1024,
-                }
-                with yt_dlp.YoutubeDL(ydl_opts_audio) as ydl:
-                    ydl.download([url])
-
-                downloaded_files = glob.glob(f"{temp_dir}/*")
-                if downloaded_files and GROQ_API_KEY:
-                    media_file = downloaded_files[0]
-                    try:
-                        groq_client = Groq(api_key=GROQ_API_KEY)
-                        with open(media_file, "rb") as f:
-                            transcription = groq_client.audio.transcriptions.create(
-                                file=(os.path.basename(media_file), f.read()),
-                                model="whisper-large-v3"
-                            )
-                        transcript_text = transcription.text
-                    except Exception as audio_err:
-                        print(f"Błąd audio: {audio_err}")
+            try:
+                transcript_text = extract_audio_and_transcribe(url)
+                if transcript_text:
+                    has_transcript = True
+            except Exception as e:
+                print(f"Transkrypcja nie powiodła się: {e}")
 
             prompt_full = f"""
             Stwórz przepis kulinarny na podstawie danych:
-            Opis: {description}
-            Transkrypcja audio: {transcript_text}
+            Opis z posta: {description}
+            Transkrypcja mowy z wideo: {transcript_text}
 
             Przetłumacz na polski i zwróć JSON:
             {{
@@ -128,13 +140,57 @@ def process_recipe_by_id(recipe_id: str, url: str):
                 "title": recipe_data.get("title", "Przepis z Reels"),
                 "ingredients": recipe_data.get("ingredients", []),
                 "instructions": recipe_data.get("instructions", []),
-                "status": "completed"
+                "status": "completed",
+                "has_transcript": has_transcript,
+                "transcript": transcript_text
             }).eq("id", recipe_id).execute()
 
     except Exception as err:
         print(f"Błąd dla przepisu {recipe_id}: {err}")
         if supabase:
             supabase.table("recipes").update({"status": "error"}).eq("id", recipe_id).execute()
+
+def enrich_recipe_with_audio_task(recipe_id: str, url: str):
+    """Zadanie w tle wymuszające pobranie audio i uzupełnienie istniejącego przepisu."""
+    try:
+        # Pobieramy dotychczasowe dane z bazy
+        current = supabase.table("recipes").select("*").eq("id", recipe_id).execute().data[0]
+        
+        # Pobieramy transkrypcję
+        transcript_text = extract_audio_and_transcribe(url)
+        
+        # Prosimy Gemini o wzbogacenie przepisu o nowe informacje z mowy
+        prompt_enrich = f"""
+        Mamy istniejący przepis kulinarny:
+        Tytuł: {current.get('title')}
+        Składniki: {json.dumps(current.get('ingredients', []), ensure_ascii=False)}
+        Instrukcje: {json.dumps(current.get('instructions', []), ensure_ascii=False)}
+
+        Oto nowo uzyskana transkrypcja mowy twórcy z filmu:
+        \"\"\"{transcript_text}\"\"\"
+
+        Zadanie: Uzupełnij i uściślij listę składników oraz kroki przygotowania o wszelkie detale, triki, czasy pieczenia/smażenia i proporcje wspomniane w mowie.
+        Przetłumacz na polski i zwróć zaktualizowany JSON:
+        {{
+            "title": "{current.get('title')}",
+            "ingredients": [{{"name": "produkt i ilość", "category": "dział w sklepie"}}],
+            "instructions": ["krok 1", "krok 2"]
+        }}
+        """
+        enriched_data = ask_gemini_with_retry(prompt_enrich)
+
+        supabase.table("recipes").update({
+            "ingredients": enriched_data.get("ingredients", current.get("ingredients")),
+            "instructions": enriched_data.get("instructions", current.get("instructions")),
+            "has_transcript": True,
+            "transcript": transcript_text,
+            "status": "completed"
+        }).eq("id", recipe_id).execute()
+        print(f"Pomyślnie uzupełniono przepis {recipe_id} o transkrypcję audio!")
+
+    except Exception as e:
+        print(f"Błąd przy dociąganiu transkrypcji: {e}")
+        supabase.table("recipes").update({"status": "completed"}).eq("id", recipe_id).execute()
 
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request):
@@ -158,14 +214,14 @@ def read_root(request: Request):
 
 @app.get("/api/status")
 def get_status_api():
-    """Zwraca liczbę zadań, by odświeżać widok po zakończeniu pobierania."""
     if supabase:
-        res = supabase.table("recipes").select("id, status").execute()
+        res = supabase.table("recipes").select("id, status, has_transcript").execute()
         data = res.data or []
         completed_count = sum(1 for r in data if r.get("status") == "completed")
         queue_count = sum(1 for r in data if r.get("status") in ["pending", "error"])
-        return {"completed": completed_count, "queue": queue_count}
-    return {"completed": 0, "queue": 0}
+        transcripts_count = sum(1 for r in data if r.get("has_transcript"))
+        return {"completed": completed_count, "queue": queue_count, "transcripts": transcripts_count}
+    return {"completed": 0, "queue": 0, "transcripts": 0}
 
 @app.post("/process")
 def process_reels(background_tasks: BackgroundTasks, url: str = Form(...)):
@@ -177,6 +233,7 @@ def process_reels(background_tasks: BackgroundTasks, url: str = Form(...)):
         "title": "Pobieranie w toku...",
         "source_url": url,
         "status": "pending",
+        "has_transcript": False,
         "ingredients": [],
         "instructions": []
     }).execute()
@@ -184,6 +241,20 @@ def process_reels(background_tasks: BackgroundTasks, url: str = Form(...)):
     recipe_id = res.data[0]["id"]
     background_tasks.add_task(process_recipe_by_id, recipe_id, url)
     return {"status": "queued", "id": recipe_id}
+
+@app.post("/enrich-audio/{recipe_id}")
+def enrich_audio(recipe_id: str, background_tasks: BackgroundTasks):
+    """Endpoint wymuszający dociągnięcie transkrypcji z audio."""
+    if not supabase:
+        return JSONResponse(status_code=500, content={"message": "Brak bazy"})
+    
+    res = supabase.table("recipes").select("*").eq("id", recipe_id).execute()
+    if not res.data:
+        return JSONResponse(status_code=404, content={"message": "Nie znaleziono"})
+    
+    recipe = res.data[0]
+    background_tasks.add_task(enrich_recipe_with_audio_task, recipe_id, recipe["source_url"])
+    return {"status": "started"}
 
 @app.post("/retry/{recipe_id}")
 def retry_recipe(recipe_id: str, background_tasks: BackgroundTasks):
@@ -205,7 +276,6 @@ def retry_recipe(recipe_id: str, background_tasks: BackgroundTasks):
 
 @app.post("/delete/{recipe_id}")
 def delete_recipe(recipe_id: str):
-    """Usuwa wpis (z kolejki lub gotowy przepis) z bazy Supabase."""
     if not supabase:
         return JSONResponse(status_code=500, content={"message": "Brak połączenia z bazą"})
     try:
