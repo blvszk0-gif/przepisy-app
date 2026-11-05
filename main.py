@@ -25,81 +25,71 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def ask_groq_ai(prompt: str):
-    """Zapasowy silnik AI z automatycznym testowaniem kolejnych modeli tekstowych."""
+    """Zapasowy silnik Groq z temperaturą 0.1 zapobiegającą pętlom i halucynacjom."""
     groq_client = Groq(api_key=GROQ_API_KEY)
     
-    # 1. Pobieramy listę modeli i odrzucamy modele audio/zewnętrzne
-    candidate_models = []
-    try:
-        models_data = groq_client.models.list().data
-        for m in models_data:
-            mid = m.id.lower()
-            # Odrzucamy modele z ukośnikiem (wymagające akceptacji licencji) i niemodelowe
-            if "/" in m.id or any(bad in mid for bad in ["whisper", "orpheus", "tts", "guard", "embed", "vision"]):
-                continue
-            candidate_models.append(m.id)
-    except Exception as e:
-        print(f"Błąd pobierania listy modeli Groq: {e}")
-
-    # Standardowa lista sprawdzonych modeli tekstowych Groq jako priorytety
-    priority_models = [
+    # Modele tekstowe w kolejności priorytetu
+    test_models = [
         "llama-3.1-8b-instant",
-        "llama-3.3-70b-versatile",
         "llama3-8b-8192",
         "mixtral-8x7b-32768",
         "gemma2-9b-it"
     ]
     
-    # Układamy ostateczną listę: najpierw znane modele, potem reszta wykrytych
-    final_models = [m for m in priority_models if m in candidate_models]
-    for m in candidate_models:
-        if m not in final_models:
-            final_models.append(m)
-    if not final_models:
-        final_models = priority_models
-
-    last_error = None
-    for model_name in final_models:
+    last_err = None
+    for model_name in test_models:
         try:
-            print(f"Próbuję model Groq: {model_name}")
+            print(f"Używam silnika zapasowego Groq: {model_name}")
             response = groq_client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {
                         "role": "system",
-                        "content": "Jesteś kucharzem i tłumaczem. Zwracasz wyłącznie czysty obiekt JSON bez formatowania markdown."
+                        "content": "Jesteś precyzyjnym asystentem kulinarnym. Odpowiadasz WYŁĄCZNIE poprawnym obiektem JSON zgodnie z zadaną strukturą. Bez komentarzy, bez markdown."
                     },
                     {"role": "user", "content": prompt}
                 ],
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
+                temperature=0.1,  # Eliminuje zapętlanie się i zmyślanie słów
+                max_tokens=2048
             )
-            return json.loads(response.choices[0].message.content.strip())
+            raw = response.choices[0].message.content.strip()
+            return json.loads(raw)
         except Exception as err:
-            print(f"Model {model_name} niedostępny ({err}). Próbuję kolejny...")
-            last_error = err
+            print(f"Model {model_name} błąd: {err}")
+            last_err = err
             continue
 
-    raise last_error or Exception("Żaden model Groq nie był w stanie przetworzyć zapytania.")
+    raise last_err or Exception("Brak dostępnego modelu w Groq")
 
 def ask_ai_smart(prompt: str):
-    """Próbuje Gemini, a w razie błędu 503 lub limitu 429 natychmiast przełącza na Groq."""
-    try:
-        if GEMINI_API_KEY:
-            client = genai.Client(api_key=GEMINI_API_KEY)
-            res = client.models.generate_content(
-                model='gemini-3.8-flash',
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json")
-            )
-            return json.loads(res.text)
-    except Exception as e:
-        print(f"[Gemini 503/429]: {e}. Przełączam na zapasowy silnik Groq...")
+    """Próbuje Gemini (z ponawianiem przy 503), a w razie twardego limitu 429 przełącza na Groq."""
+    if GEMINI_API_KEY:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        for attempt in range(3):
+            try:
+                res = client.models.generate_content(
+                    model='gemini-3.8-flash',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json")
+                )
+                return json.loads(res.text)
+            except Exception as e:
+                err_msg = str(e)
+                # Chwilowe przeciążenie (503) - czekamy 3 sekundy i ponawiamy Gemini
+                if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < 2:
+                    print(f"[Gemini 503] Chwilowe przeciążenie. Próba {attempt+1}/3 za 3 sekundy...")
+                    time.sleep(3)
+                    continue
+                print(f"[Gemini błąd]: {err_msg}. Przełączam na Groq Llama...")
+                break
 
+    # Przełączenie awaryjne na Groq z zabezpieczoną temperaturą
     return ask_groq_ai(prompt)
 
 def process_recipe_by_id(recipe_id: str, url: str):
     try:
-        # KROK 1: Pobieranie opisu posta
+        # KROK 1: Pobranie opisu i analiza strumieni wideo/audio
         supabase.table("recipes").update({
             "status": "processing",
             "progress_step": 1,
@@ -108,13 +98,12 @@ def process_recipe_by_id(recipe_id: str, url: str):
 
         description = ""
         transcript_text = ""
-        available_formats = []
+        formats = []
 
-        # Ekstrakcja metadanych bez pobierania całego pliku
         with yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True, 'socket_timeout': 15}) as ydl:
             info = ydl.extract_info(url, download=False)
             description = info.get('description', '') or ''
-            available_formats = info.get('formats', [])
+            formats = info.get('formats', []) or []
 
         supabase.table("recipes").update({
             "original_description": description,
@@ -122,44 +111,47 @@ def process_recipe_by_id(recipe_id: str, url: str):
             "progress_text": "Pobieranie audio i transkrypcja mowy (Whisper)..."
         }).eq("id", recipe_id).execute()
 
-        # KROK 2: Wymuszenie formatu z wbudowanym audio (format '0' na Instagramie)
-        try:
-            format_ids = [str(f.get('format_id')) for f in available_formats]
-            
-            # Wybieramy format '0' (mobilny MP4 z dźwiękiem) lub pierwszy format z audio
-            if '0' in format_ids:
-                chosen_format = '0'
-            else:
-                chosen_format = 'bestaudio/b[acodec!=none]/worst[acodec!=none]/worst'
+        # KROK 2: Sprawdzenie, który strumień NA PEWNO ma ścieżkę dźwiękową
+        audio_stream_id = None
+        for f in formats:
+            # Szukamy formatu z aktywnym kodekiem audio (różnym od 'none')
+            if f.get('acodec') and f.get('acodec') != 'none':
+                audio_stream_id = str(f.get('format_id'))
+                break
 
-            with tempfile.TemporaryDirectory() as temp_dir:
-                ydl_opts = {
-                    'format': chosen_format,
-                    'outtmpl': f'{temp_dir}/media.%(ext)s',
-                    'quiet': True,
-                    'no_warnings': True,
-                    'socket_timeout': 30,
-                    'max_filesize': 35 * 1024 * 1024,
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
+        if audio_stream_id and GROQ_API_KEY:
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    ydl_opts = {
+                        'format': audio_stream_id,
+                        'outtmpl': f'{temp_dir}/media.%(ext)s',
+                        'quiet': True,
+                        'no_warnings': True,
+                        'socket_timeout': 30,
+                        'max_filesize': 35 * 1024 * 1024,
+                    }
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
 
-                downloaded_files = glob.glob(f"{temp_dir}/*")
-                if downloaded_files and GROQ_API_KEY:
-                    media_file = downloaded_files[0]
-                    groq_client = Groq(api_key=GROQ_API_KEY)
-                    with open(media_file, "rb") as f:
-                        transcription = groq_client.audio.transcriptions.create(
-                            file=(os.path.basename(media_file), f.read()),
-                            model="whisper-large-v3"
-                        )
-                    transcript_text = transcription.text.strip()
-                    print(f"Transkrypcja Whisper zakończona sukcesem ({len(transcript_text)} znaków)")
-        except Exception as audio_err:
-            print(f"Pominięto audio (brak mowy lub format nieobsługiwany): {audio_err}")
-            transcript_text = "(Nie wykryto mowy w filmie)"
+                    downloaded_files = glob.glob(f"{temp_dir}/*")
+                    if downloaded_files:
+                        media_file = downloaded_files[0]
+                        groq_client = Groq(api_key=GROQ_API_KEY)
+                        with open(media_file, "rb") as f:
+                            transcription = groq_client.audio.transcriptions.create(
+                                file=(os.path.basename(media_file), f.read()),
+                                model="whisper-large-v3"
+                            )
+                        transcript_text = transcription.text.strip()
+                        print(f"Pomyślna transkrypcja Whisper: {transcript_text[:60]}...")
+            except Exception as audio_err:
+                print(f"Pominięto audio (błąd transkrypcji): {audio_err}")
+                transcript_text = "(Nie wykryto mowy w filmie)"
+        else:
+            print("Rolka nie zawiera strumienia audio – opieram się wyłącznie na opisie.")
+            transcript_text = "(Rolka bez ścieżki dźwiękowej)"
 
-        # KROK 3: Przetworzenie całości przez AI
+        # KROK 3: Połączenie materiałów przez AI
         supabase.table("recipes").update({
             "progress_step": 3,
             "progress_text": "Scalanie opisu i transkrypcji przez AI...",
@@ -167,28 +159,28 @@ def process_recipe_by_id(recipe_id: str, url: str):
         }).eq("id", recipe_id).execute()
 
         prompt = f"""
-        Stwórz kompletny przepis kulinarny łącząc dwa źródła:
+        Stwórz kompletny, zwięzły przepis kulinarny w języku polskim łącząc dwa źródła:
 
-        1. OPIS Z POSTA:
+        ŹRÓDŁO 1 (Opis pod postem):
         \"\"\"{description}\"\"\"
 
-        2. TRANSKRYPCJA Z WIDEO:
+        ŹRÓDŁO 2 (Mowa twórcy z nagrania):
         \"\"\"{transcript_text}\"\"\"
 
-        Wytyczne:
-        - Połącz składniki i kroki w jedną całość. Jeśli w wideo nie ma mowy, oprzyj się w 100% na opisie posta.
-        - Przetłumacz na język polski. Przelicz jednostki (uncje, cup na gramy/ml/łyżki).
-        - Zwróć wynik jako czysty JSON:
+        Zasady:
+        - Jeśli w jednym źródle są składniki, a w drugim wskazówki – połącz je w spójną całość.
+        - Przelicz jednostki (np. uncje/cups na gramy, ml, łyżki).
+        - Zwróć WYŁĄCZNIE czysty JSON o strukturze:
         {{
-            "title": "Tytuł dania",
-            "ingredients": [{{"name": "produkt i ilość", "category": "dział w sklepie (np. Nabiał, Warzywa, Przyprawy)"}}],
-            "instructions": ["krok 1", "krok 2"]
+            "title": "Dokładny tytuł dania po polsku",
+            "ingredients": [{{"name": "nazwa i ilość produktu", "category": "dział w markecie"}}],
+            "instructions": ["Krok 1 przygotowania", "Krok 2 przygotowania"]
         }}
         """
 
         recipe_data = ask_ai_smart(prompt)
 
-        # KROK 4: Zapis gotowego dania
+        # KROK 4: Zapis do Supabase
         supabase.table("recipes").update({
             "title": recipe_data.get("title", "Przepis z Reels"),
             "ingredients": recipe_data.get("ingredients", []),
@@ -199,9 +191,10 @@ def process_recipe_by_id(recipe_id: str, url: str):
             "transcript": transcript_text,
             "original_description": description
         }).eq("id", recipe_id).execute()
+        print(f"Przepis {recipe_id} pomyślnie zapisany!")
 
     except Exception as err:
-        print(f"Błąd dla przepisu {recipe_id}: {err}")
+        print(f"Krytyczny błąd dla {recipe_id}: {err}")
         if supabase:
             supabase.table("recipes").update({
                 "status": "error",
