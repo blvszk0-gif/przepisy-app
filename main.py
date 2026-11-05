@@ -24,22 +24,49 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def ask_groq_llama(prompt: str):
-    """Zapasowy silnik AI (Groq Llama 3.3 70B) z potężnym darmowym limitem."""
+def get_best_groq_model(groq_client):
+    """Automatycznie dobiera najlepszy dostępny model na Twoim koncie Groq."""
+    preferred = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama-3.1-8b-instant",
+        "llama3-70b-8192",
+        "llama3-8b-8192",
+        "gemma2-9b-it"
+    ]
+    try:
+        models = groq_client.models.list().data
+        available = [m.id for m in models if "whisper" not in m.id]
+        for p in preferred:
+            if p in available:
+                return p
+        if available:
+            return available[0]
+    except Exception as e:
+        print(f"Błąd sprawdzania listy modeli Groq: {e}")
+    return "llama-3.1-8b-instant"
+
+def ask_groq_ai(prompt: str):
+    """Zapasowy silnik AI (Groq Llama) z bardzo wysokimi limitami dziennymi."""
     groq_client = Groq(api_key=GROQ_API_KEY)
+    model_name = get_best_groq_model(groq_client)
+    print(f"Używam modelu Groq AI: {model_name}")
+
     response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=model_name,
         messages=[
-            {"role": "system", "content": "Jesteś kucharzem i tłumaczem. Zwracasz wyłącznie poprawny obiekt JSON zgodnie ze schematem, bez żadnego formatowania markdown ani zbędnych komentarzy."},
+            {
+                "role": "system",
+                "content": "Jesteś kucharzem i tłumaczem. Zwracasz wyłącznie czysty obiekt JSON bez formatowania markdown."
+            },
             {"role": "user", "content": prompt}
         ],
         response_format={"type": "json_object"}
     )
-    raw_text = response.choices[0].message.content.strip()
-    return json.loads(raw_text)
+    return json.loads(response.choices[0].message.content.strip())
 
 def ask_ai_smart(prompt: str):
-    """Próbuje Gemini, a w razie błędu 429 lub przeciążenia natychmiast przełącza na Groq Llama."""
+    """Próbuje Gemini, a w razie blokady limitu natychmiast przełącza na Groq."""
     try:
         if GEMINI_API_KEY:
             client = genai.Client(api_key=GEMINI_API_KEY)
@@ -50,25 +77,23 @@ def ask_ai_smart(prompt: str):
             )
             return json.loads(res.text)
     except Exception as e:
-        err_msg = str(e)
-        print(f"[Gemini niedostępne / 429 limit]: {err_msg}. Przełączam awaryjnie na Groq Llama 3.3 70B...")
+        print(f"[Gemini niedostępne / limit]: {e}. Przełączam na silnik Groq Llama...")
 
-    # Zapasowy silnik AI (zawsze działa, nie wymaga czekania 8 godzin)
-    return ask_groq_llama(prompt)
+    return ask_groq_ai(prompt)
 
 def process_recipe_by_id(recipe_id: str, url: str):
     try:
-        # KROK 1: Pobieranie opisu i audio
+        # KROK 1: Pobieranie opisu
         supabase.table("recipes").update({
             "status": "processing",
             "progress_step": 1,
-            "progress_text": "Pobieranie opisu posta i multimediów..."
+            "progress_text": "Pobieranie opisu posta i wideo..."
         }).eq("id", recipe_id).execute()
 
         description = ""
         transcript_text = ""
 
-        # Pobranie samego opisu
+        # Pobieranie samego opisu
         with yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True, 'socket_timeout': 15}) as ydl:
             info = ydl.extract_info(url, download=False)
             description = info.get('description', '') or ''
@@ -76,14 +101,14 @@ def process_recipe_by_id(recipe_id: str, url: str):
         supabase.table("recipes").update({
             "original_description": description,
             "progress_step": 2,
-            "progress_text": "Pobieranie i transkrypcja mowy (Whisper)..."
+            "progress_text": "Pobieranie audio i transkrypcja mowy (Whisper)..."
         }).eq("id", recipe_id).execute()
 
-        # Pobranie audio i transkrypcja
+        # Pobieranie strumienia z dźwiękiem (wymuszamy filtr acodec!=none)
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 ydl_opts = {
-                    'format': 'ba/b[height<=480]/b/worst',
+                    'format': 'bestaudio[acodec!=none]/best[acodec!=none]/worst[acodec!=none]/best',
                     'outtmpl': f'{temp_dir}/media.%(ext)s',
                     'quiet': True,
                     'no_warnings': True,
@@ -103,12 +128,12 @@ def process_recipe_by_id(recipe_id: str, url: str):
                             model="whisper-large-v3"
                         )
                     transcript_text = transcription.text.strip()
-                    print(f"Pomyślna transkrypcja Whisper: {transcript_text[:50]}...")
+                    print(f"Transkrypcja udana: {transcript_text[:50]}...")
         except Exception as audio_err:
-            print(f"Pominięto audio (błąd lub brak mowy): {audio_err}")
-            transcript_text = "(Nie wykryto mowy lub audio niedostępne)"
+            print(f"Pominięto audio (brak mowy lub format nieobsługiwany): {audio_err}")
+            transcript_text = "(Nie wykryto mowy w filmie)"
 
-        # KROK 3: Przetworzenie całości (Gemini -> automatyczny fallback na Groq Llama)
+        # KROK 3: Przetworzenie całości przez AI
         supabase.table("recipes").update({
             "progress_step": 3,
             "progress_text": "Scalanie opisu i transkrypcji przez AI...",
@@ -125,9 +150,9 @@ def process_recipe_by_id(recipe_id: str, url: str):
         \"\"\"{transcript_text}\"\"\"
 
         Wytyczne:
-        - Połącz składniki i kroki w jedną całość. Jeśli audio nie ma mowy, oprzyj się w 100% na opisie.
-        - Przetłumacz wszystko na język polski. Przelicz jednostki (uncje, cup na gramy/ml/łyżki).
-        - Zwróć wynik jako obiekt JSON o strukturze:
+        - Połącz składniki i kroki w jedną całość. Jeśli w wideo nie ma mowy, oprzyj się w 100% na opisie posta.
+        - Przetłumacz na język polski. Przelicz jednostki (uncje, cup na gramy/ml/łyżki).
+        - Zwróć wynik jako czysty JSON:
         {{
             "title": "Tytuł dania",
             "ingredients": [{{"name": "produkt i ilość", "category": "dział w sklepie (np. Nabiał, Warzywa, Przyprawy)"}}],
@@ -137,7 +162,7 @@ def process_recipe_by_id(recipe_id: str, url: str):
 
         recipe_data = ask_ai_smart(prompt)
 
-        # KROK 4: Zapis gotowego przepisu
+        # KROK 4: Zapis gotowego dania
         supabase.table("recipes").update({
             "title": recipe_data.get("title", "Przepis z Reels"),
             "ingredients": recipe_data.get("ingredients", []),
