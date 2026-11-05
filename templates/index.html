@@ -27,13 +27,10 @@
 </head>
 <body class="bg-zinc-950 text-zinc-100 min-h-screen flex flex-col font-sans antialiased selection:bg-emerald-500/20 selection:text-emerald-400">
 
-    <!-- Pasek górny -->
     <header class="border-b border-zinc-800/80 bg-zinc-900/60 backdrop-blur-md sticky top-0 z-50">
         <div class="max-w-5xl mx-auto px-4 py-3 flex flex-col sm:flex-row items-center justify-between gap-3">
             <div class="flex items-center gap-3">
-                <span class="p-2 rounded-xl bg-gradient-to-tr from-emerald-500/20 to-teal-500/10 border border-emerald-500/30 text-emerald-400">
-                    🍳
-                </span>
+                <span class="p-2 rounded-xl bg-gradient-to-tr from-emerald-500/20 to-teal-500/10 border border-emerald-500/30 text-emerald-400">🍳</span>
                 <span class="font-bold text-lg tracking-tight bg-gradient-to-r from-zinc-100 to-zinc-400 bg-clip-text text-transparent">Reels Chef</span>
             </div>
 
@@ -45,7 +42,7 @@
                 <button onclick="switchTab('queue')" id="tabBtn-queue"
                     class="tab-btn px-3 py-1.5 rounded-lg font-medium transition-all flex items-center gap-1.5 text-zinc-400 hover:text-zinc-200">
                     <span>Kolejka</span>
-                    <span id="queueBadge" class="px-1.5 py-0.2 rounded-full text-[11px] bg-zinc-800 text-zinc-300 font-mono">{{ queue|length }}</span>
+                    <span id="queueBadge" class="px-1.5 py-0.2 rounded-full text-[11px] bg-zinc-800 text-zinc-300 font-mono">0</span>
                 </button>
                 <button onclick="switchTab('recipes')" id="tabBtn-recipes"
                     class="tab-btn px-3 py-1.5 rounded-lg font-medium transition-all flex items-center gap-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shadow-sm">
@@ -61,8 +58,8 @@
         <!-- ZAKŁADKA 1: IMPORT -->
         <section id="tab-import" class="hidden max-w-xl mx-auto">
             <div class="text-center mb-6">
-                <h1 class="text-2xl md:text-3xl font-extrabold tracking-tight text-white mb-2">Wklej rolki do kolejki</h1>
-                <p class="text-zinc-400 text-sm">Wklejaj linki jeden po drugim – serwer przetworzy je po kolei w tle.</p>
+                <h1 class="text-2xl md:text-3xl font-extrabold tracking-tight text-white mb-2">Wklej rolkę z Instagrama</h1>
+                <p class="text-zinc-400 text-sm">Aplikacja pobierze opis posta ORAZ nagranie audio, sprawnie połączy je przez AI i rozpisze przepis.</p>
             </div>
 
             <div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 shadow-2xl">
@@ -77,62 +74,28 @@
                 </form>
 
                 <div id="queueNotice" class="hidden mt-4 p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-emerald-400 text-xs text-center">
-                    ✅ <b>Dodano!</b> Rolka przetwarza się w tle. Możesz wkleić następny link.
+                    ✅ <b>Dodano!</b> Przekierowuję do zakładki Kolejka...
                 </div>
             </div>
         </section>
 
-        <!-- ZAKŁADKA 2: KOLEJKA -->
+        <!-- ZAKŁADKA 2: KOLEJKA NA ŻYWO -->
         <section id="tab-queue" class="hidden">
             <div class="flex items-center justify-between mb-6">
                 <div>
                     <h2 class="text-xl font-bold text-zinc-100">Kolejka zadań w tle</h2>
-                    <p class="text-xs text-zinc-500">Pobierane lub wymagające ponowienia rolki.</p>
+                    <p class="text-xs text-zinc-500">Postęp pobierania opisu, audio i transkrypcji na żywo.</p>
                 </div>
-                <button onclick="window.location.reload()" class="text-xs text-zinc-400 hover:text-emerald-400 transition flex items-center gap-1 py-1.5 px-3 rounded-lg border border-zinc-800 bg-zinc-900">
-                    🔄 Odśwież
+                <button onclick="pollQueue()" class="text-xs text-zinc-400 hover:text-emerald-400 transition flex items-center gap-1 py-1.5 px-3 rounded-lg border border-zinc-800 bg-zinc-900">
+                    🔄 Odśwież status
                 </button>
             </div>
 
-            <div id="queueList" class="space-y-3">
-                {% for item in queue %}
-                <div id="item-{{ item.id }}" class="bg-zinc-900 border border-zinc-800 rounded-xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-                    <div class="flex-1 min-w-0">
-                        <div class="flex items-center gap-2 mb-1">
-                            {% if item.status == 'pending' %}
-                            <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                                W trakcie przetwarzania...
-                            </span>
-                            {% else %}
-                            <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-rose-500/10 text-rose-400 border border-rose-500/20">
-                                ⚠️ Błąd serwerów AI
-                            </span>
-                            {% endif %}
-                        </div>
-                        <a href="{{ item.source_url }}" target="_blank" class="text-xs text-zinc-400 hover:text-zinc-200 truncate block max-w-md">
-                            🔗 {{ item.source_url }}
-                        </a>
-                    </div>
-
-                    <div class="flex items-center gap-2 w-full sm:w-auto justify-end border-t sm:border-t-0 border-zinc-800/80 pt-2 sm:pt-0">
-                        {% if item.status == 'error' %}
-                        <button onclick="retryItem('{{ item.id }}', this)" 
-                            class="px-3 py-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 text-xs font-medium transition flex items-center gap-1">
-                            🔄 Ponów
-                        </button>
-                        {% endif %}
-                        <button onclick="deleteItem('{{ item.id }}', 'item-{{ item.id }}')" 
-                            class="px-3 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-400 text-xs font-medium transition flex items-center gap-1">
-                            🗑️ Usuń
-                        </button>
-                    </div>
-                </div>
-                {% else %}
-                <div class="py-16 text-center text-zinc-600 border border-dashed border-zinc-800 rounded-2xl">
+            <!-- Kontener na zadania generowane przez JavaScript w czasie rzeczywistym -->
+            <div id="queueContainer" class="space-y-4">
+                <div class="py-12 text-center text-zinc-600 border border-dashed border-zinc-800 rounded-2xl">
                     <p class="text-sm">Kolejka jest pusta. Wszystkie rolki zostały przetworzone!</p>
                 </div>
-                {% endfor %}
             </div>
         </section>
 
@@ -141,9 +104,7 @@
             <div class="flex flex-col sm:flex-row gap-3 items-center justify-between mb-8">
                 <input type="text" id="recipeSearch" oninput="filterRecipes()" placeholder="Szukaj dania lub składnika..."
                     class="w-full sm:w-80 px-4 py-2 bg-zinc-900 border border-zinc-800 rounded-xl text-zinc-200 placeholder-zinc-500 text-sm focus:outline-none focus:ring-1 focus:ring-emerald-500">
-                <span class="text-xs text-zinc-500">
-                    Kliknij przepis, aby otworzyć składniki i instrukcję
-                </span>
+                <span class="text-xs text-zinc-500">Kliknij przepis, aby otworzyć listę zakupów i transkrypcję</span>
             </div>
 
             <div id="recipesContainer" class="grid grid-cols-1 md:grid-cols-2 gap-5">
@@ -170,25 +131,13 @@
                             </div>
                         </div>
 
-                        <!-- Etykiety i status transkrypcji -->
                         <div class="flex flex-wrap items-center gap-2 mb-4 text-xs">
                             <span class="px-2.5 py-0.5 rounded-full bg-zinc-800 border border-zinc-700/50 text-zinc-300">
                                 🛒 {{ recipe.ingredients | length }} składników
                             </span>
-                            
-                            {% if recipe.has_transcript %}
-                            <span class="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">
+                            <span class="px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">
                                 🎙️ Audio + Opis
                             </span>
-                            {% else %}
-                            <span class="px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 font-medium">
-                                📝 Tylko opis
-                            </span>
-                            <button onclick="enrichAudio('{{ recipe.id }}', this)" 
-                                    class="px-2.5 py-0.5 rounded-full bg-zinc-800 hover:bg-emerald-500/20 hover:text-emerald-300 border border-zinc-700 hover:border-emerald-500/30 text-zinc-300 font-medium transition flex items-center gap-1">
-                                🎙️ Dociągnij audio z rolki
-                            </button>
-                            {% endif %}
                         </div>
                     </div>
 
@@ -216,7 +165,7 @@
                                 </div>
                             </div>
 
-                            <!-- Przygotowanie -->
+                            <!-- Kroki -->
                             <div>
                                 <h3 class="text-xs font-semibold uppercase text-emerald-400 mb-2">Przygotowanie:</h3>
                                 <ol class="space-y-1.5 text-xs text-zinc-400 list-decimal pl-4">
@@ -226,12 +175,27 @@
                                 </ol>
                             </div>
 
-                            <!-- Transkrypcja słowo w słowo (jeśli istnieje) -->
-                            {% if recipe.transcript %}
+                            <!-- Oryginalny opis posta -->
+                            {% if recipe.original_description %}
                             <div class="border-t border-zinc-850 pt-3">
                                 <details class="group">
-                                    <summary class="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider cursor-pointer hover:text-zinc-400 select-none flex items-center gap-1">
-                                        <span>📄 Pełna transkrypcja słowo w słowo</span>
+                                    <summary class="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider cursor-pointer hover:text-zinc-400 select-none flex items-center justify-between">
+                                        <span>📝 Oryginalny opis z Instagrama</span>
+                                        <span class="text-[9px] group-open:rotate-180 transition-transform">▼</span>
+                                    </summary>
+                                    <p class="mt-2 text-xs text-zinc-400 bg-zinc-950/80 p-3 rounded-xl border border-zinc-850 leading-relaxed whitespace-pre-wrap">
+                                        {{ recipe.original_description }}
+                                    </p>
+                                </details>
+                            </div>
+                            {% endif %}
+
+                            <!-- Transkrypcja słowo w słowo -->
+                            {% if recipe.transcript %}
+                            <div class="border-t border-zinc-850 pt-2">
+                                <details class="group">
+                                    <summary class="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider cursor-pointer hover:text-zinc-400 select-none flex items-center justify-between">
+                                        <span>🎙️ Pełna transkrypcja wideo (Whisper)</span>
                                         <span class="text-[9px] group-open:rotate-180 transition-transform">▼</span>
                                     </summary>
                                     <p class="mt-2 text-xs text-zinc-400 bg-zinc-950/80 p-3 rounded-xl border border-zinc-850 leading-relaxed italic">
@@ -253,9 +217,7 @@
     </main>
 
     <script>
-        let currentCompletedCount = {{ recipes|length }};
-        let currentQueueCount = {{ queue|length }};
-        let currentTranscriptsCount = {{ recipes | selectattr('has_transcript') | list | length }};
+        let initialCompletedCount = {{ recipes|length }};
 
         function switchTab(tabId) {
             ['import', 'queue', 'recipes'].forEach(t => {
@@ -267,6 +229,7 @@
                     btn.className = "tab-btn px-3 py-1.5 rounded-lg font-medium transition-all flex items-center gap-1.5 text-zinc-400 hover:text-zinc-200";
                 }
             });
+            if(tabId === 'queue') pollQueue();
         }
 
         function toggleDetails(id, btn) {
@@ -285,64 +248,127 @@
             });
         }
 
+        // POBIERANIE STANU KOLEJKI NA ŻYWO
+        async function pollQueue() {
+            try {
+                const res = await fetch('/api/queue');
+                const queueData = await res.json();
+                
+                document.getElementById('queueBadge').innerText = queueData.length;
+
+                const container = document.getElementById('queueContainer');
+                if (queueData.length === 0) {
+                    container.innerHTML = `
+                        <div class="py-12 text-center text-zinc-600 border border-dashed border-zinc-800 rounded-2xl">
+                            <p class="text-sm">Kolejka jest pusta. Wszystkie rolki zostały przetworzone!</p>
+                        </div>
+                    `;
+                } else {
+                    container.innerHTML = queueData.map(item => {
+                        const isError = item.status === 'error';
+                        const step = item.progress_step || 1;
+                        
+                        return `
+                        <div class="bg-zinc-900 border ${isError ? 'border-rose-900/50' : 'border-zinc-800'} rounded-2xl p-5 shadow-sm">
+                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+                                <div class="min-w-0">
+                                    <div class="flex items-center gap-2 mb-1">
+                                        <span class="w-2.5 h-2.5 rounded-full ${isError ? 'bg-rose-500' : 'bg-emerald-400 animate-pulse'}"></span>
+                                        <span class="text-sm font-semibold ${isError ? 'text-rose-400' : 'text-zinc-200'}">
+                                            ${item.progress_text || 'Przetwarzanie...'}
+                                        </span>
+                                    </div>
+                                    <a href="${item.source_url}" target="_blank" class="text-xs text-zinc-500 hover:text-zinc-300 truncate block max-w-md">
+                                        🔗 ${item.source_url}
+                                    </a>
+                                </div>
+                                <div class="flex items-center gap-2 self-end sm:self-center">
+                                    ${isError ? `
+                                        <button onclick="retryItem('${item.id}', this)" class="px-3 py-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 text-xs font-medium transition">
+                                            🔄 Ponów
+                                        </button>
+                                    ` : ''}
+                                    <button onclick="deleteItem('${item.id}', null)" class="px-3 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 text-rose-400 text-xs font-medium transition">
+                                        🗑️ Usuń
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Pasek etapów (1: Opis i audio, 2: Transkrypcja Whisper, 3: Scalanie AI) -->
+                            ${!isError ? `
+                            <div class="grid grid-cols-3 gap-2 pt-2 border-t border-zinc-800/60">
+                                <div class="flex flex-col gap-1">
+                                    <div class="h-1.5 rounded-full ${step >= 1 ? 'bg-emerald-500' : 'bg-zinc-800'}"></div>
+                                    <span class="text-[10px] ${step >= 1 ? 'text-emerald-400' : 'text-zinc-600'}">1. Pobieranie</span>
+                                </div>
+                                <div class="flex flex-col gap-1">
+                                    <div class="h-1.5 rounded-full ${step >= 2 ? 'bg-emerald-500' : 'bg-zinc-800'}"></div>
+                                    <span class="text-[10px] ${step >= 2 ? 'text-emerald-400' : 'text-zinc-600'}">2. Transkrypcja</span>
+                                </div>
+                                <div class="flex flex-col gap-1">
+                                    <div class="h-1.5 rounded-full ${step >= 3 ? 'bg-emerald-500' : 'bg-zinc-800'}"></div>
+                                    <span class="text-[10px] ${step >= 3 ? 'text-emerald-400' : 'text-zinc-600'}">3. Scalanie AI</span>
+                                </div>
+                            </div>
+                            ` : `
+                            <div class="text-xs text-rose-400/90 bg-rose-950/30 p-2.5 rounded-xl border border-rose-900/30">
+                                ${item.error_message || 'Błąd połączenia z API. Kliknij Ponów, aby ponowić próbę.'}
+                            </div>
+                            `}
+                        </div>
+                        `;
+                    }).join('');
+                }
+
+                // Sprawdź, czy przybyły nowe przepisy
+                const countRes = await fetch('/api/recipes-count');
+                const countData = await countRes.json();
+                if (countData.count > initialCompletedCount) {
+                    window.location.reload();
+                }
+            } catch (err) {}
+        }
+
+        // DODAWANIE DO KOLEJKI
         document.getElementById('urlForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const input = document.getElementById('ig_url');
             const notice = document.getElementById('queueNotice');
-            const val = input.value;
+            const urlVal = input.value;
             input.value = '';
 
             notice.classList.remove('hidden');
-            setTimeout(() => notice.classList.add('hidden'), 4000);
 
             const formData = new FormData();
-            formData.append('url', val);
+            formData.append('url', urlVal);
             await fetch('/process', { method: 'POST', body: formData });
-            
-            currentQueueCount++;
-            document.getElementById('queueBadge').innerText = currentQueueCount;
+
+            setTimeout(() => {
+                notice.classList.add('hidden');
+                switchTab('queue');
+            }, 600);
         });
 
-        // Przycisk: Dociągnij audio z rolki
-        async function enrichAudio(id, btn) {
-            btn.disabled = true;
-            btn.innerHTML = "⏳ Dociągam audio...";
-            btn.classList.add('opacity-50', 'cursor-not-allowed');
-            await fetch(`/enrich-audio/${id}`, { method: 'POST' });
-            alert("Rozpoczęto pobieranie dźwięku i transkrypcji w tle! Przepis zaktualizuje się automatycznie za około 20-30 sekund.");
-        }
-
-        async function deleteItem(id, elementDomId) {
+        async function deleteItem(id, domId) {
             if (!confirm("Czy na pewno chcesz to usunąć?")) return;
-            const el = document.getElementById(elementDomId);
-            if (el) { el.style.opacity = '0.3'; el.style.pointerEvents = 'none'; }
-
-            try {
-                const res = await fetch(`/delete/${id}`, { method: 'POST' });
-                if (res.ok && el) el.remove();
-            } catch (err) {
-                alert("Błąd połączenia");
-                if (el) el.style.opacity = '1';
+            await fetch(`/delete/${id}`, { method: 'POST' });
+            if (domId) {
+                const el = document.getElementById(domId);
+                if (el) el.remove();
             }
+            pollQueue();
         }
 
         async function retryItem(id, btn) {
             btn.disabled = true;
-            btn.innerHTML = "⏳ Ponawiam...";
+            btn.innerHTML = "⏳ Start...";
             await fetch(`/retry/${id}`, { method: 'POST' });
-            window.location.reload();
+            pollQueue();
         }
 
-        // Ciche odświeżanie strony, gdy pojawi się nowy przepis lub dociągnie audio
-        setInterval(async () => {
-            try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-                if (data.completed !== currentCompletedCount || data.transcripts !== currentTranscriptsCount) {
-                    window.location.reload();
-                }
-            } catch (e) {}
-        }, 8000);
+        // Odpytywanie kolejki co 3 sekundy
+        pollQueue();
+        setInterval(pollQueue, 3000);
     </script>
 </body>
 </html>
