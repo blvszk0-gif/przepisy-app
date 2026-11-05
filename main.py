@@ -27,8 +27,10 @@ if SUPABASE_URL and SUPABASE_KEY:
 def get_gemini_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
-def ask_gemini_with_retry(prompt: str, max_retries: int = 3):
+def ask_gemini_with_retry(prompt: str, max_retries: int = 4):
+    """Odpytuje Gemini z wydłużającymi się przerwami (2s, 6s, 12s) przy błędzie 503."""
     client = get_gemini_client()
+    delays = [2, 6, 12, 20]
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
@@ -38,16 +40,19 @@ def ask_gemini_with_retry(prompt: str, max_retries: int = 3):
             )
             return json.loads(response.text)
         except Exception as e:
-            if ("503" in str(e) or "UNAVAILABLE" in str(e)) and attempt < max_retries - 1:
-                time.sleep(3)
+            err_msg = str(e)
+            if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < max_retries - 1:
+                wait_time = delays[attempt]
+                print(f"[Gemini 503] Serwery zajęte. Próba {attempt+1}/{max_retries}. Oczekiwanie {wait_time}s...")
+                time.sleep(wait_time)
                 continue
             raise e
 
-def process_reels_task(url: str):
-    """Zadanie wykonywane w tle – bezpieczne, z limitami czasowymi."""
+def process_recipe_by_id(recipe_id: str, url: str):
+    """Główne zadanie przetwarzania w tle powiązane z konkretnym ID w bazie."""
     try:
         description = ""
-        # ETAP 1: Błyskawiczne pobranie samych metadanych (opisu) bez ściągania wideo
+        # 1. Błyskawiczne metadane
         ydl_opts_meta = {
             'skip_download': True,
             'quiet': True,
@@ -58,32 +63,30 @@ def process_reels_task(url: str):
             info = ydl.extract_info(url, download=False)
             description = info.get('description', '') or ''
 
-        # Sprawdzamy, czy w opisie jest już kompletny przepis
         recipe_data = None
         if len(description.strip()) > 40:
             prompt_check = f"""
-            Przeanalizuj opis z rolki na Instagramie:
+            Przeanalizuj opis z rolki:
             \"\"\"{description}\"\"\"
 
             Czy ten opis zawiera składniki ORAZ kroki przygotowania dania?
-            Jeśli TAK, ułóż z niego przepis, przetłumacz na polski i zwróć JSON:
+            Jeśli TAK, przetłumacz na polski i zwróć JSON:
             {{
                 "has_recipe": true,
                 "title": "Tytuł dania",
                 "ingredients": [{{"name": "produkt i ilość", "category": "dział w sklepie"}}],
                 "instructions": ["krok 1", "krok 2"]
             }}
-            Jeśli NIE (np. brak składników lub tylko krótki opis bez proporcji), zwróć po prostu:
-            {{"has_recipe": false}}
+            Jeśli NIE, zwróć: {{"has_recipe": false}}
             """
             try:
-                result = ask_gemini_with_retry(prompt_check)
-                if result.get("has_recipe"):
-                    recipe_data = result
+                res = ask_gemini_with_retry(prompt_check)
+                if res.get("has_recipe"):
+                    recipe_data = res
             except Exception as e:
-                print(f"Błąd analizy opisu: {e}")
+                print(f"Błąd analizy tekstu opisu: {e}")
 
-        # ETAP 2: Jeśli w opisie nie ma przepisu, dopiero wtedy pobieramy dźwięk i robimy transkrypcję
+        # 2. Pobieranie audio i transkrypcja tylko jeśli przepis nie był w opisie
         if not recipe_data:
             transcript_text = ""
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -110,9 +113,8 @@ def process_reels_task(url: str):
                             )
                         transcript_text = transcription.text
                     except Exception as audio_err:
-                        print(f"Błąd transkrypcji: {audio_err}")
+                        print(f"Błąd audio: {audio_err}")
 
-            # Wysyłamy połączony opis i transkrypcję do Gemini
             prompt_full = f"""
             Stwórz przepis kulinarny na podstawie danych:
             Opis: {description}
@@ -127,18 +129,22 @@ def process_reels_task(url: str):
             """
             recipe_data = ask_gemini_with_retry(prompt_full)
 
-        # ETAP 3: Zapis do bazy danych Supabase
+        # 3. Zapisanie gotowego przepisu w Supabase
         if recipe_data and supabase:
-            supabase.table("recipes").insert({
+            supabase.table("recipes").update({
                 "title": recipe_data.get("title", "Przepis z Reels"),
                 "ingredients": recipe_data.get("ingredients", []),
                 "instructions": recipe_data.get("instructions", []),
-                "source_url": url
-            }).execute()
-            print(f"Pomyślnie dodano przepis: {recipe_data.get('title')}")
+                "status": "completed"
+            }).eq("id", recipe_id).execute()
+            print(f"Sukces: Przepis {recipe_id} gotowy!")
 
     except Exception as err:
-        print(f"Błąd przetwarzania w tle dla {url}: {err}")
+        print(f"Błąd dla przepisu {recipe_id}: {err}")
+        if supabase:
+            supabase.table("recipes").update({
+                "status": "error"
+            }).eq("id", recipe_id).execute()
 
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request):
@@ -148,19 +154,62 @@ def read_root(request: Request):
             response = supabase.table("recipes").select("*").order("created_at", desc=True).execute()
             recipes = response.data
         except Exception as e:
-            print(f"Błąd pobierania bazy: {e}")
+            print(f"Błąd bazy: {e}")
     return templates.TemplateResponse(request=request, name="index.html", context={"recipes": recipes})
 
 @app.get("/api/recipes")
 def get_recipes_api():
-    """Endpoint do cichego sprawdzania nowo dodanych przepisów w tle."""
+    """Zwraca stan przepisów, aby frontend wiedział, kiedy odświeżyć widok."""
     if supabase:
-        res = supabase.table("recipes").select("id, title, created_at").order("created_at", desc=True).execute()
+        res = supabase.table("recipes").select("id, status").order("created_at", desc=True).execute()
         return res.data
     return []
 
 @app.post("/process")
 def process_reels(background_tasks: BackgroundTasks, url: str = Form(...)):
-    # Natychmiast dodajemy zadanie do kolejki w tle – odpowiedź wraca w 0.2 sekundy!
-    background_tasks.add_task(process_reels_task, url.strip())
-    return {"status": "queued", "message": "Rolka dodana do kolejki przetwarzania!"}
+    url = url.strip()
+    if not supabase:
+        return JSONResponse(status_code=500, content={"message": "Brak połączenia z bazą"})
+    
+    # Tworzymy wstępny wpis w bazie ze statusem "pending"
+    res = supabase.table("recipes").insert({
+        "title": "Przetwarzanie rolki...",
+        "source_url": url,
+        "status": "pending",
+        "ingredients": [],
+        "instructions": []
+    }).execute()
+    
+    recipe_id = res.data[0]["id"]
+    background_tasks.add_task(process_recipe_by_id, recipe_id, url)
+    return {"status": "queued", "id": recipe_id}
+
+@app.post("/retry/{recipe_id}")
+def retry_recipe(recipe_id: str, background_tasks: BackgroundTasks):
+    """Ręczne lub automatyczne ponowienie tylko nieudanego przepisu."""
+    if not supabase:
+        return JSONResponse(status_code=500, content={"message": "Błąd bazy"})
+
+    res = supabase.table("recipes").select("*").eq("id", recipe_id).execute()
+    if not res.data:
+        return JSONResponse(status_code=404, content={"message": "Nie znaleziono"})
+    
+    recipe = res.data[0]
+    supabase.table("recipes").update({
+        "title": "Ponawianie próby...",
+        "status": "pending"
+    }).eq("id", recipe_id).execute()
+
+    background_tasks.add_task(process_recipe_by_id, recipe_id, recipe["source_url"])
+    return {"status": "retrying"}
+
+@app.get("/api/cron-retry")
+def cron_retry_all_failed(background_tasks: BackgroundTasks):
+    """Endpoint dla zewnętrznego budzika (np. codziennie o 9:00 rano)."""
+    if not supabase:
+        return {"status": "no db"}
+    failed = supabase.table("recipes").select("*").eq("status", "error").execute()
+    for r in failed.data:
+        supabase.table("recipes").update({"status": "pending", "title": "Automatyczne ponawianie..."}).eq("id", r["id"]).execute()
+        background_tasks.add_task(process_recipe_by_id, r["id"], r["source_url"])
+    return {"status": "retried", "count": len(failed.data)}
