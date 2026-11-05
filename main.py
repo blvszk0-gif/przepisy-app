@@ -28,7 +28,6 @@ def get_gemini_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
 def ask_gemini_with_retry(prompt: str, max_retries: int = 4):
-    """Odpytuje Gemini z wydłużającymi się przerwami (2s, 6s, 12s) przy błędzie 503."""
     client = get_gemini_client()
     delays = [2, 6, 12, 20]
     for attempt in range(max_retries):
@@ -42,17 +41,13 @@ def ask_gemini_with_retry(prompt: str, max_retries: int = 4):
         except Exception as e:
             err_msg = str(e)
             if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < max_retries - 1:
-                wait_time = delays[attempt]
-                print(f"[Gemini 503] Serwery zajęte. Próba {attempt+1}/{max_retries}. Oczekiwanie {wait_time}s...")
-                time.sleep(wait_time)
+                time.sleep(delays[attempt])
                 continue
             raise e
 
 def process_recipe_by_id(recipe_id: str, url: str):
-    """Główne zadanie przetwarzania w tle powiązane z konkretnym ID w bazie."""
     try:
         description = ""
-        # 1. Błyskawiczne metadane
         ydl_opts_meta = {
             'skip_download': True,
             'quiet': True,
@@ -66,7 +61,7 @@ def process_recipe_by_id(recipe_id: str, url: str):
         recipe_data = None
         if len(description.strip()) > 40:
             prompt_check = f"""
-            Przeanalizuj opis z rolki:
+            Przeanalizuj opis z rolki kulinarnej:
             \"\"\"{description}\"\"\"
 
             Czy ten opis zawiera składniki ORAZ kroki przygotowania dania?
@@ -86,7 +81,6 @@ def process_recipe_by_id(recipe_id: str, url: str):
             except Exception as e:
                 print(f"Błąd analizy tekstu opisu: {e}")
 
-        # 2. Pobieranie audio i transkrypcja tylko jeśli przepis nie był w opisie
         if not recipe_data:
             transcript_text = ""
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -129,7 +123,6 @@ def process_recipe_by_id(recipe_id: str, url: str):
             """
             recipe_data = ask_gemini_with_retry(prompt_full)
 
-        # 3. Zapisanie gotowego przepisu w Supabase
         if recipe_data and supabase:
             supabase.table("recipes").update({
                 "title": recipe_data.get("title", "Przepis z Reels"),
@@ -137,43 +130,51 @@ def process_recipe_by_id(recipe_id: str, url: str):
                 "instructions": recipe_data.get("instructions", []),
                 "status": "completed"
             }).eq("id", recipe_id).execute()
-            print(f"Sukces: Przepis {recipe_id} gotowy!")
 
     except Exception as err:
         print(f"Błąd dla przepisu {recipe_id}: {err}")
         if supabase:
-            supabase.table("recipes").update({
-                "status": "error"
-            }).eq("id", recipe_id).execute()
+            supabase.table("recipes").update({"status": "error"}).eq("id", recipe_id).execute()
 
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request):
     recipes = []
+    queue = []
     if supabase:
         try:
-            response = supabase.table("recipes").select("*").order("created_at", desc=True).execute()
-            recipes = response.data
+            res = supabase.table("recipes").select("*").order("created_at", desc=True).execute()
+            for r in (res.data or []):
+                if r.get("status") == "completed":
+                    recipes.append(r)
+                else:
+                    queue.append(r)
         except Exception as e:
             print(f"Błąd bazy: {e}")
-    return templates.TemplateResponse(request=request, name="index.html", context={"recipes": recipes})
+    return templates.TemplateResponse(
+        request=request, 
+        name="index.html", 
+        context={"recipes": recipes, "queue": queue}
+    )
 
-@app.get("/api/recipes")
-def get_recipes_api():
-    """Zwraca stan przepisów, aby frontend wiedział, kiedy odświeżyć widok."""
+@app.get("/api/status")
+def get_status_api():
+    """Zwraca liczbę zadań, by odświeżać widok po zakończeniu pobierania."""
     if supabase:
-        res = supabase.table("recipes").select("id, status").order("created_at", desc=True).execute()
-        return res.data
-    return []
+        res = supabase.table("recipes").select("id, status").execute()
+        data = res.data or []
+        completed_count = sum(1 for r in data if r.get("status") == "completed")
+        queue_count = sum(1 for r in data if r.get("status") in ["pending", "error"])
+        return {"completed": completed_count, "queue": queue_count}
+    return {"completed": 0, "queue": 0}
 
 @app.post("/process")
 def process_reels(background_tasks: BackgroundTasks, url: str = Form(...)):
     url = url.strip()
     if not supabase:
-        return JSONResponse(status_code=500, content={"message": "Brak połączenia z bazą"})
+        return JSONResponse(status_code=500, content={"message": "Brak bazy"})
     
-    # Tworzymy wstępny wpis w bazie ze statusem "pending"
     res = supabase.table("recipes").insert({
-        "title": "Przetwarzanie rolki...",
+        "title": "Pobieranie w toku...",
         "source_url": url,
         "status": "pending",
         "ingredients": [],
@@ -186,7 +187,6 @@ def process_reels(background_tasks: BackgroundTasks, url: str = Form(...)):
 
 @app.post("/retry/{recipe_id}")
 def retry_recipe(recipe_id: str, background_tasks: BackgroundTasks):
-    """Ręczne lub automatyczne ponowienie tylko nieudanego przepisu."""
     if not supabase:
         return JSONResponse(status_code=500, content={"message": "Błąd bazy"})
 
@@ -203,13 +203,13 @@ def retry_recipe(recipe_id: str, background_tasks: BackgroundTasks):
     background_tasks.add_task(process_recipe_by_id, recipe_id, recipe["source_url"])
     return {"status": "retrying"}
 
-@app.get("/api/cron-retry")
-def cron_retry_all_failed(background_tasks: BackgroundTasks):
-    """Endpoint dla zewnętrznego budzika (np. codziennie o 9:00 rano)."""
+@app.post("/delete/{recipe_id}")
+def delete_recipe(recipe_id: str):
+    """Usuwa wpis (z kolejki lub gotowy przepis) z bazy Supabase."""
     if not supabase:
-        return {"status": "no db"}
-    failed = supabase.table("recipes").select("*").eq("status", "error").execute()
-    for r in failed.data:
-        supabase.table("recipes").update({"status": "pending", "title": "Automatyczne ponawianie..."}).eq("id", r["id"]).execute()
-        background_tasks.add_task(process_recipe_by_id, r["id"], r["source_url"])
-    return {"status": "retried", "count": len(failed.data)}
+        return JSONResponse(status_code=500, content={"message": "Brak połączenia z bazą"})
+    try:
+        supabase.table("recipes").delete().eq("id", recipe_id).execute()
+        return {"status": "deleted", "id": recipe_id}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"message": str(e)})
