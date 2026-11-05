@@ -2,6 +2,7 @@ import os
 import json
 import tempfile
 import glob
+import time
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -69,7 +70,7 @@ def process_reels(url: str = Form(...)):
                     print(f"Pominięto transkrypcję (brak wykrywalnego dźwięku/mowy): {audio_err}")
                     transcript_text = ""
 
-        # 3. Analiza i tłumaczenie przez Gemini API
+        # 3. Analiza i tłumaczenie przez Gemini API (z automatycznym ponawianiem przy 503)
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = f"""
         Przeanalizuj przepis kulinarny.
@@ -87,11 +88,24 @@ def process_reels(url: str = Form(...)):
         }}
         """
         
-        ai_response = gemini_client.models.generate_content(
-            model='gemini-3.8-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
+        ai_response = None
+        # Próbujemy do 3 razy z krótkim odstępem czasowym
+        for attempt in range(3):
+            try:
+                ai_response = gemini_client.models.generate_content(
+                    model='gemini-3.8-flash',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json")
+                )
+                break
+            except Exception as e:
+                if "503" in str(e) or "UNAVAILABLE" in str(e):
+                    time.sleep(3)  # odczekaj 3 sekundy, aż obciążenie serwera spadnie
+                    continue
+                raise e
+
+        if not ai_response:
+            raise Exception("Serwery AI były chwilowo zajęte. Spróbuj kliknąć ponownie za chwilę.")
         
         recipe_data = json.loads(ai_response.text)
 
