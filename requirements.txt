@@ -7,4 +7,3 @@ supabase
 python-multipart
 jinja2
 pydantic
-static-ffmpeg
