@@ -30,7 +30,7 @@ def read_root(request: Request):
     if SUPABASE_URL:
         response = supabase.table("recipes").select("*").order("created_at", desc=True).execute()
         recipes = response.data
-    return templates.TemplateResponse("index.html", {"request": request, "recipes": recipes})
+    return templates.TemplateResponse(request=request, name="index.html", context={"recipes": recipes})
 
 @app.post("/process")
 def process_reels(url: str = Form(...)):
