@@ -1,6 +1,7 @@
 import os
 import json
 import tempfile
+import glob
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -13,48 +14,60 @@ from supabase import create_client, Client
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-# Konfiguracja API i Bazy Danych pobierana ze zmiennych środowiskowych
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# Inicjalizacja klientów (tylko jeśli klucze są dostępne)
 if SUPABASE_URL and SUPABASE_KEY:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request):
-    # Pobieranie zapisanych przepisów z bazy danych przy otwarciu strony
     recipes = []
     if SUPABASE_URL:
-        response = supabase.table("recipes").select("*").order("created_at", desc=True).execute()
-        recipes = response.data
+        try:
+            response = supabase.table("recipes").select("*").order("created_at", desc=True).execute()
+            recipes = response.data
+        except Exception as e:
+            print(f"Błąd bazy danych: {e}")
     return templates.TemplateResponse(request=request, name="index.html", context={"recipes": recipes})
 
 @app.post("/process")
 def process_reels(url: str = Form(...)):
     try:
-        # 1. Pobieranie z Instagrama (wybieramy najmniejszy plik wideo, by oszczędzić czas i RAM)
+        description = ""
+        transcript_text = ""
+
+        # 1. Pobieranie danych z Instagrama (wymuszenie strumienia audio)
         with tempfile.TemporaryDirectory() as temp_dir:
             ydl_opts = {
-                'format': 'worst[ext=mp4]',
+                'format': 'ba/b',  # Pobiera sam dźwięk lub plik ze ścieżką audio
                 'outtmpl': f'{temp_dir}/%(id)s.%(ext)s',
                 'quiet': True,
+                'no_warnings': True,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 description = info.get('description', '')
-                video_filename = ydl.prepare_filename(info)
 
-            # 2. Transkrypcja wideo przez Groq (Whisper)
-            groq_client = Groq(api_key=GROQ_API_KEY)
-            with open(video_filename, "rb") as file:
-                transcription = groq_client.audio.transcriptions.create(
-                    file=(os.path.basename(video_filename), file.read()),
-                    model="whisper-large-v3"
-                )
-            transcript_text = transcription.text
+            # Znalezienie pobranego pliku w folderze tymczasowym
+            downloaded_files = glob.glob(f"{temp_dir}/*")
+
+            # 2. Bezpieczna transkrypcja z Groq (jeśli plik zawiera dźwięk)
+            if downloaded_files and GROQ_API_KEY:
+                media_file = downloaded_files[0]
+                try:
+                    groq_client = Groq(api_key=GROQ_API_KEY)
+                    with open(media_file, "rb") as file:
+                        transcription = groq_client.audio.transcriptions.create(
+                            file=(os.path.basename(media_file), file.read()),
+                            model="whisper-large-v3"
+                        )
+                    transcript_text = transcription.text
+                except Exception as audio_err:
+                    print(f"Pominięto transkrypcję (brak wykrywalnego dźwięku/mowy): {audio_err}")
+                    transcript_text = ""
 
         # 3. Analiza i tłumaczenie przez Gemini API
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -64,11 +77,12 @@ def process_reels(url: str = Form(...)):
         Transkrypcja wideo (mowa): {transcript_text}
         
         Wymagania:
-        1. Przetłumacz na język polski. Przelicz jednostki (np. uncje na gramy).
-        2. Zwróć wynik jako czysty JSON o strukturze:
+        1. Jeśli w opisie lub transkrypcji znajduje się przepis, ułóż z niego czytelną listę składników i kroków.
+        2. Przetłumacz na język polski. Przelicz jednostki (np. uncje na gramy).
+        3. Zwróć wynik jako czysty JSON o strukturze:
         {{
             "title": "Krótki tytuł przepisu",
-            "ingredients": [{{"name": "nazwa produktu i ilość", "category": "dział w sklepie (np. Nabiał, Warzywa)"}}],
+            "ingredients": [{{"name": "nazwa produktu i ilość", "category": "dział w sklepie (np. Nabiał, Warzywa, Mięso)"}}],
             "instructions": ["krok 1", "krok 2"]
         }}
         """
@@ -81,9 +95,9 @@ def process_reels(url: str = Form(...)):
         
         recipe_data = json.loads(ai_response.text)
 
-        # 4. Zapis do bazy danych Supabase
+        # 4. Zapis do Supabase
         if SUPABASE_URL:
-            db_insert = supabase.table("recipes").insert({
+            supabase.table("recipes").insert({
                 "title": recipe_data["title"],
                 "ingredients": recipe_data["ingredients"],
                 "instructions": recipe_data["instructions"],
