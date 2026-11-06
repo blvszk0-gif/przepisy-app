@@ -4,6 +4,7 @@ import re
 import tempfile
 import glob
 import time
+from typing import List
 from fastapi import FastAPI, Request, Form, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -12,6 +13,7 @@ from groq import Groq
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
+from pydantic import BaseModel, Field
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
@@ -25,106 +27,75 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def ask_groq_ai(prompt: str):
-    groq_client = Groq(api_key=GROQ_API_KEY)
+# ==========================================
+# MODEL STRUKTURY DANYCH (PYDANTIC)
+# ==========================================
+class IngredientModel(BaseModel):
+    name: str = Field(description="Dokładna nazwa składnika wraz z ilością, np. '3 jajka', '150 ml śmietanki 30%', '180 g herbatników'")
+    category: str = Field(description="Kategoria sklepowa, np. Nabiał, Warzywa i owoce, Produkty sypkie, Mięso, Inne")
+
+class RecipeResponseModel(BaseModel):
+    title: str = Field(description="Konkretna nazwa potrawy, np. Kremowy sernik, Puszysty omlet")
+    ingredients: List[IngredientModel] = Field(description="Lista wszystkich realnych składników z przepisu")
+    instructions: List[str] = Field(description="Kroki przygotowania krok po kroku")
+
+
+def ask_ai_structured(description: str, transcript_text: str):
+    """Używa Gemini z wymuszonym schematem Pydantic – model nie może zwrócić innego formatu ani zmyślać."""
+    if not GEMINI_API_KEY:
+        raise Exception("Brak klucza GEMINI_API_KEY w zmiennych środowiskowych!")
     
-    active_models = []
-    try:
-        models_data = groq_client.models.list().data
-        for m in models_data:
-            mid = m.id.lower()
-            is_active = getattr(m, 'active', True)
-            is_specialized = any(x in mid for x in ["whisper", "guard", "orpheus", "embed", "tts", "vision"])
-            if is_active and not is_specialized and "/" not in m.id:
-                active_models.append(m.id)
-    except Exception as e:
-        print(f"Błąd modeli Groq: {e}")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    
+    prompt = f"""
+    Przeanalizuj poniższy opis z Instagrama oraz transkrypcję audio i wyciągnij z nich DOKŁADNY przepis kulinarny.
+    Bezwzględnie ignoruj hasztagi, teksty sponsorowane, prośby o obserwowanie oraz zwroty marketingowe. Nie wymyślaj składników, których nie ma w tekście.
 
-    if not active_models:
-        active_models = ["llama-3.1-8b-instant"]
+    OPIS Z INSTAGRAMA:
+    \"\"\"{description}\"\"\"
 
-    active_models.sort(key=lambda name: 0 if "llama-3.1-8b" in name else (1 if "llama-3.3" in name else 2))
+    TRANSKRYPCJA AUDIO:
+    \"\"\"{transcript_text}\"\"\"
+    """
 
-    system_instruction = (
-        "Jesteś precyzyjnym asystentem kulinarnym. Twoim jedynym celem jest wyodrębnienie "
-        "rzeczywistych składników i instrukcji z tekstu użytkownika. "
-        "Zwracasz czysty JSON. Nigdy nie kopiujesz nazw pól ani słów kluczowych jako wartości."
-    )
-
-    for model_name in active_models:
+    for attempt in range(3):
         try:
-            resp = groq_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.1,
-                max_tokens=2048
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=RecipeResponseModel,
+                    temperature=0.0, # Zerowa temperatura = zero zmyślania, pełna dosłowność
+                ),
             )
-            return json.loads(resp.choices[0].message.content.strip())
-        except Exception:
-            try:
-                resp = groq_client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.1,
-                    max_tokens=2048
-                )
-                match = re.search(r'\{.*\}', resp.choices[0].message.content.strip(), re.DOTALL)
-                if match:
-                    return json.loads(match.group(0))
-            except Exception:
+            return json.loads(response.text)
+        except Exception as e:
+            err_msg = str(e)
+            if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < 2:
+                time.sleep(3)
                 continue
+            if attempt == 2:
+                raise e
+    raise Exception("Brak odpowiedzi od Gemini API")
 
-    raise Exception("Brak dostępnego modelu w Groq")
-
-def ask_ai_smart(prompt: str):
-    # Najpierw próbujemy użyć mocniejszego modelu Gemini z bardzo niską temperaturą (0.0), 
-    # żeby model był maksymalnie dosłowny i nie halucynował.
-    if GEMINI_API_KEY:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        for attempt in range(3):
-            try:
-                res = client.models.generate_content(
-                    model='gemini-flash', # Zaktualizowałem też stabilny model flash
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.0 # Zerowa temperatura eliminująca wymyślanie
-                    )
-                )
-                return json.loads(res.text)
-            except Exception as e:
-                err_msg = str(e)
-                if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < 2:
-                    time.sleep(3)
-                    continue
-                break
-    return ask_groq_ai(prompt)
 
 def sanitize_recipe_data(raw_data: dict, fallback_description: str = "") -> dict:
-    """Weryfikuje, czy AI nie zwróciło zaślepek z szablonu, i oczyszcza dane."""
+    """Weryfikuje i oczyszcza dane w razie awaryjnych sytuacji."""
     raw_title = str(raw_data.get("title", "")).strip()
     
-    # Blokada kopiowania zaślepek tytułu
     if not raw_title or "apetyczny tytuł" in raw_title.lower() or "przepis z reels" in raw_title.lower():
-        # Pobieramy pierwszą sensowną linijkę z opisu jako tytuł
         lines = [l.strip() for l in fallback_description.split("\n") if len(l.strip()) > 3]
         raw_title = lines[0][:60] if lines else "Przepis z Instagrama"
 
     dummy_phrases = [
         "dokładna nazwa", "kategoria w markecie", "ilość produktu", 
-        "przygotowanie...", "krok 1:", "krok 2:", "kombinuj składniki", "żywy produkt"
+        "przygotowanie...", "krok 1:", "krok 2:", "kombinuj składniki"
     ]
 
     cleaned_ingredients = []
     seen = set()
-    banned_words = {"składniki", "składnik", "ingredients", "ingredient", "żywność", "krew", "śmieci"}
+    banned_words = {"składniki", "składnik", "ingredients", "ingredient", "żywność"}
 
     for item in raw_data.get("ingredients", []):
         if isinstance(item, dict):
@@ -135,7 +106,6 @@ def sanitize_recipe_data(raw_data: dict, fallback_description: str = "") -> dict
             cat = "Inne"
 
         name_lower = name.lower()
-        # Wykrycie i odrzucenie przekopiowanej zaślepki
         if any(d in name_lower for d in dummy_phrases):
             continue
         if not name or len(name) < 2 or name_lower in banned_words or name_lower in seen:
@@ -151,27 +121,16 @@ def sanitize_recipe_data(raw_data: dict, fallback_description: str = "") -> dict
         s_lower = s.lower()
         if any(d in s_lower for d in dummy_phrases):
             continue
-        s = re.sub(r'\bZłość\b', 'Złóż / wymieszaj', s, flags=re.IGNORECASE)
         if s and len(s) > 3 and s_lower not in seen_steps:
             seen_steps.add(s_lower)
             cleaned_instructions.append(s)
-
-    # Awaryjne wyciąganie z opisu posta, gdy model zawiedzie na całej linii
-    if not cleaned_ingredients and fallback_description:
-        desc_lines = [l.strip() for l in fallback_description.split("\n") if l.strip()]
-        for l in desc_lines:
-            if any(char in l for char in ["-", "•", "*", "g ", "ml", "łyż", "szt"]):
-                cleaned_ingredients.append({"name": l.lstrip("-•* "), "category": "Produkty"})
-
-    if not cleaned_instructions and fallback_description:
-        desc_lines = [l.strip() for l in fallback_description.split("\n") if len(l.strip()) > 15]
-        cleaned_instructions = desc_lines[:8]
 
     return {
         "title": raw_title,
         "ingredients": cleaned_ingredients,
         "instructions": cleaned_instructions
     }
+
 
 def process_recipe_by_id(recipe_id: str, url: str):
     try:
@@ -235,46 +194,11 @@ def process_recipe_by_id(recipe_id: str, url: str):
 
         supabase.table("recipes").update({
             "progress_step": 3,
-            "progress_text": "Weryfikacja krzyżowa opisu i audio...",
+            "progress_text": "Analiza treści przez Gemini...",
             "transcript": transcript_text
         }).eq("id", recipe_id).execute()
 
-        # RYGORYSTYCZNY PROMPT DOSTOSOWANY DO SPECYFIKI ROLEK INSTAGRAMOWYCH
-        prompt = f"""
-        Jesteś profesjonalnym szefem kuchni i analitykiem danych kulinarnych. Twoim zadaniem jest przeanalizowanie surowego opisu z Instagrama oraz transkrypcji wideo i wyciągnięcie z nich PRAWDZIWEGO przepisu.
-
-        TEKST Z OPISU POSTA (często zawiera hasztagi, emoji i zbędny marketing):
-        \"\"\"{description}\"\"\"
-
-        TRANSKRYPCJA AUDIO Z WIDEO (często zawiera szumy, błędy rozpoznawania mowy):
-        \"\"\"{transcript_text}\"\"\"
-
-        BEZWZGLĘDNE ZASADY, KTÓRE MUSISZ SPEŁNIĆ:
-        1. TYTUŁ: Wyciągnij konkretną nazwę dania (np. "Kremowy sernik", "Omlet puszysty", "Tarta z gruszką"). Nigdy nie wpisuj w tytuł hasztagów ani zachęt typu "Zapisz przepis".
-        2. SKŁADNIKI: 
-           - Wypisz TYLKO realne produkty spożywcze wraz z ich ilościami (np. "3 jajka", "1 łyżka masła", "100g sera bursztyn"), jeśli występują w tekście lub audio.
-           - BEZWZGLĘDNIE ODRZUĆ: hasztagi (#airfryer, #przepis, #fyp), słowa z piosenek, zwroty marketingowe, pojedyncze dziwne wyrazy typu "żaba", "mieszek", "żelazo", "wypowiedzi".
-           - Jeśli w tekście nie ma gramatury, wpisz samą nazwę produktu (np. "ciasto francuskie", "gruszka"), ale nazwa musi być sensownym artykułem spożywczym.
-           - Dopasuj właściwą kategorię sklepową (np. Nabiał, Warzywa i owoce, Produkty sypkie, Mięso, Pieczywo, Przyprawy, Inne).
-        3. PRZYGOTOWANIE:
-           - Stwórz krok po kroku instrukcję gotowania/pieczenia. 
-           - Usuń z kroków wszelkie wstępy typu "To jest pyszne", podziękowania, prośby o obserwację profilu czy hasztagi. Zostaw sam proces kulinarny.
-
-        ZWRÓĆ WYŁĄCZNIE CZYSTY OBIEKT JSON W TYM DOKŁADNYM FORMACIE:
-        {{
-            "title": "Dokładna nazwa potrawy",
-            "ingredients": [
-                {{"name": "3 jajka", "category": "Nabiał"}},
-                {{"name": "1 łyżka masła", "category": "Nabiał"}}
-            ],
-            "instructions": [
-                "Oddziel białka od żółtek i ubij na sztywną pianę.",
-                "Rozgrzej masło na patelni i wylej masę jajeczną."
-            ]
-        }}
-        """
-
-        raw_recipe = ask_ai_smart(prompt)
+        raw_recipe = ask_ai_structured(description, transcript_text)
         recipe_data = sanitize_recipe_data(raw_recipe, fallback_description=description)
 
         supabase.table("recipes").update({
@@ -297,6 +221,7 @@ def process_recipe_by_id(recipe_id: str, url: str):
                 "error_message": str(err)
             }).eq("id", recipe_id).execute()
 
+
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request):
     recipes = []
@@ -308,6 +233,7 @@ def read_root(request: Request):
             print(f"Błąd bazy: {e}")
     return templates.TemplateResponse(request=request, name="index.html", context={"recipes": recipes})
 
+
 @app.get("/api/queue")
 def get_queue_api():
     if supabase:
@@ -315,12 +241,14 @@ def get_queue_api():
         return res.data or []
     return []
 
+
 @app.get("/api/recipes-count")
 def get_recipes_count():
     if supabase:
         res = supabase.table("recipes").select("id", count="exact").eq("status", "completed").execute()
         return {"count": res.count or 0}
     return {"count": 0}
+
 
 @app.post("/edit/{recipe_id}")
 def edit_recipe(
@@ -360,6 +288,7 @@ def edit_recipe(
     except Exception as e:
         return JSONResponse(status_code=500, content={"message": str(e)})
 
+
 @app.post("/process")
 def process_reels(background_tasks: BackgroundTasks, url: str = Form(...)):
     url = url.strip()
@@ -379,6 +308,7 @@ def process_reels(background_tasks: BackgroundTasks, url: str = Form(...)):
     recipe_id = res.data[0]["id"]
     background_tasks.add_task(process_recipe_by_id, recipe_id, url)
     return {"status": "queued", "id": recipe_id}
+
 
 @app.post("/retry/{recipe_id}")
 def retry_recipe(recipe_id: str, background_tasks: BackgroundTasks):
@@ -400,6 +330,7 @@ def retry_recipe(recipe_id: str, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(process_recipe_by_id, recipe_id, recipe["source_url"])
     return {"status": "retrying"}
+
 
 @app.post("/delete/{recipe_id}")
 def delete_recipe(recipe_id: str):
