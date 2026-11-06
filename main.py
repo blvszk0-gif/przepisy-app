@@ -84,14 +84,19 @@ def ask_groq_ai(prompt: str):
     raise Exception("Brak dostępnego modelu w Groq")
 
 def ask_ai_smart(prompt: str):
+    # Najpierw próbujemy użyć mocniejszego modelu Gemini z bardzo niską temperaturą (0.0), 
+    # żeby model był maksymalnie dosłowny i nie halucynował.
     if GEMINI_API_KEY:
         client = genai.Client(api_key=GEMINI_API_KEY)
         for attempt in range(3):
             try:
                 res = client.models.generate_content(
-                    model='gemini-3.8-flash',
+                    model='gemini-flash', # Zaktualizowałem też stabilny model flash
                     contents=prompt,
-                    config=types.GenerateContentConfig(response_mime_type="application/json")
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.0 # Zerowa temperatura eliminująca wymyślanie
+                    )
                 )
                 return json.loads(res.text)
             except Exception as e:
@@ -234,31 +239,37 @@ def process_recipe_by_id(recipe_id: str, url: str):
             "transcript": transcript_text
         }).eq("id", recipe_id).execute()
 
-        # BEZPIECZNY PROMPT BEZ TEKSTOWYCH ZAŚLEPEK DO SKOPIOWANIA
+        # RYGORYSTYCZNY PROMPT DOSTOSOWANY DO SPECYFIKI ROLEK INSTAGRAMOWYCH
         prompt = f"""
-        Przeanalizuj poniższe materiały kulinarne i wyciągnij z nich faktyczny przepis:
+        Jesteś profesjonalnym szefem kuchni i analitykiem danych kulinarnych. Twoim zadaniem jest przeanalizowanie surowego opisu z Instagrama oraz transkrypcji wideo i wyciągnięcie z nich PRAWDZIWEGO przepisu.
 
-        TEKST Z OPISU POSTA:
+        TEKST Z OPISU POSTA (często zawiera hasztagi, emoji i zbędny marketing):
         \"\"\"{description}\"\"\"
 
-        TRANSKRYPCJA AUDIO:
+        TRANSKRYPCJA AUDIO Z WIDEO (często zawiera szumy, błędy rozpoznawania mowy):
         \"\"\"{transcript_text}\"\"\"
 
-        ZASADY:
-        1. Jeśli w tekście opisu znajdują się składniki i proporcje, wyciągnij je dokładnie.
-        2. Odrzuć z audio wszelkie nielogiczne słowa, teksty piosenek lub szumy.
-        3. Do każdego składnika dopasuj kategorię (np. Nabiał, Warzywa i owoce, Sypkie, Mięso, Przyprawy, Inne).
-        4. Rozpisz kolejne czynności przygotowania na czytelne punkty.
+        BEZWZGLĘDNE ZASADY, KTÓRE MUSISZ SPEŁNIĆ:
+        1. TYTUŁ: Wyciągnij konkretną nazwę dania (np. "Kremowy sernik", "Omlet puszysty", "Tarta z gruszką"). Nigdy nie wpisuj w tytuł hasztagów ani zachęt typu "Zapisz przepis".
+        2. SKŁADNIKI: 
+           - Wypisz TYLKO realne produkty spożywcze wraz z ich ilościami (np. "3 jajka", "1 łyżka masła", "100g sera bursztyn"), jeśli występują w tekście lub audio.
+           - BEZWZGLĘDNIE ODRZUĆ: hasztagi (#airfryer, #przepis, #fyp), słowa z piosenek, zwroty marketingowe, pojedyncze dziwne wyrazy typu "żaba", "mieszek", "żelazo", "wypowiedzi".
+           - Jeśli w tekście nie ma gramatury, wpisz samą nazwę produktu (np. "ciasto francuskie", "gruszka"), ale nazwa musi być sensownym artykułem spożywczym.
+           - Dopasuj właściwą kategorię sklepową (np. Nabiał, Warzywa i owoce, Produkty sypkie, Mięso, Pieczywo, Przyprawy, Inne).
+        3. PRZYGOTOWANIE:
+           - Stwórz krok po kroku instrukcję gotowania/pieczenia. 
+           - Usuń z kroków wszelkie wstępy typu "To jest pyszne", podziękowania, prośby o obserwację profilu czy hasztagi. Zostaw sam proces kulinarny.
 
-        ZWRÓĆ WYŁĄCZNIE CZYSTY OBIEKT JSON W TYM FORMACIE:
+        ZWRÓĆ WYŁĄCZNIE CZYSTY OBIEKT JSON W TYM DOKŁADNYM FORMACIE:
         {{
-            "title": "nazwa potrawy ustalona na podstawie tekstu",
+            "title": "Dokładna nazwa potrawy",
             "ingredients": [
-                {{"name": "nazwa produktu z gramaturą lub ilością", "category": "dział sklepu"}}
+                {{"name": "3 jajka", "category": "Nabiał"}},
+                {{"name": "1 łyżka masła", "category": "Nabiał"}}
             ],
             "instructions": [
-                "opis pierwszej czynności",
-                "opis drugiej czynności"
+                "Oddziel białka od żółtek i ubij na sztywną pianę.",
+                "Rozgrzej masło na patelni i wylej masę jajeczną."
             ]
         }}
         """
