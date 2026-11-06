@@ -41,7 +41,7 @@ class RecipeResponseModel(BaseModel):
 
 
 def ask_ai_structured(description: str, transcript_text: str):
-    """Używa Gemini z wymuszonym schematem Pydantic – model nie może zwrócić innego formatu ani zmyślać."""
+    """Używa Gemini z wymuszonym schematem Pydantic i automatycznym ponawianiem przy przekroczeniu limitu (429)."""
     if not GEMINI_API_KEY:
         raise Exception("Brak klucza GEMINI_API_KEY w zmiennych środowiskowych!")
     
@@ -58,7 +58,10 @@ def ask_ai_structured(description: str, transcript_text: str):
     \"\"\"{transcript_text}\"\"\"
     """
 
-    for attempt in range(3):
+    max_retries = 5
+    backoff_factor = 5  # Liczba sekund bazowych do odczekania
+
+    for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
                 model='gemini-3.8-flash',
@@ -66,18 +69,21 @@ def ask_ai_structured(description: str, transcript_text: str):
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=RecipeResponseModel,
-                    temperature=0.0, # Zerowa temperatura = zero zmyślania, pełna dosłowność
+                    temperature=0.0,
                 ),
             )
             return json.loads(response.text)
         except Exception as e:
             err_msg = str(e)
-            if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < 2:
-                time.sleep(3)
+            # Sprawdzamy czy to błąd przekroczenia limitu (429 / RESOURCE_EXHAUSTED) lub przeciążenie (503)
+            if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < max_retries - 1:
+                sleep_time = backoff_factor * (attempt + 1)  # Rosnący czas oczekiwania: 5s, 10s, 15s...
+                print(f"Przekroczono limit zapytań (429). Czekam {sleep_time} sekund przed ponowieniem (próba {attempt+1}/{max_retries})...")
+                time.sleep(sleep_time)
                 continue
-            if attempt == 2:
+            if attempt == max_retries - 1:
                 raise e
-    raise Exception("Brak odpowiedzi od Gemini API")
+    raise Exception("Brak odpowiedzi od Gemini API po wielokrotnych próbach")
 
 
 def sanitize_recipe_data(raw_data: dict, fallback_description: str = "") -> dict:
