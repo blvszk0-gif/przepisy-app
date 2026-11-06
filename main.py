@@ -26,7 +26,7 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def ask_groq_ai(prompt: str):
-    """Zapasowy silnik AI z filtrem modeli i precyzyjnym system promptem."""
+    """Zapasowy silnik AI z automatycznym wyborem modelu i bezpieczną temperaturą."""
     groq_client = Groq(api_key=GROQ_API_KEY)
     
     active_models = []
@@ -39,7 +39,7 @@ def ask_groq_ai(prompt: str):
             if is_active and not is_specialized and "/" not in m.id:
                 active_models.append(m.id)
     except Exception as e:
-        print(f"Błąd sprawdzania modeli Groq: {e}")
+        print(f"Błąd modeli Groq: {e}")
 
     if not active_models:
         active_models = ["llama-3.1-8b-instant"]
@@ -47,9 +47,9 @@ def ask_groq_ai(prompt: str):
     active_models.sort(key=lambda name: 0 if "llama-3.1-8b" in name else (1 if "llama-3.3" in name else 2))
 
     system_instruction = (
-        "Jesteś profesjonalnym polskim szefem kuchni. Twoim zadaniem jest przygotowanie "
-        "poprawnego, w 100% logicznego przepisu kulinarnego w języku polskim. "
-        "Zwracasz WYŁĄCZNIE czysty JSON. Ignorujesz nielogiczne szumy z transkrypcji audio."
+        "Jesteś precyzyjnym weryfikatorem kulinarnym. "
+        "Twoim zadaniem jest stworzyć w 100% logiczny przepis w języku polskim. "
+        "Zwracasz WYŁĄCZNIE czysty JSON bez komentarzy."
     )
 
     for model_name in active_models:
@@ -64,8 +64,7 @@ def ask_groq_ai(prompt: str):
                 temperature=0.1,
                 max_tokens=2048
             )
-            raw = resp.choices[0].message.content.strip()
-            return json.loads(raw)
+            return json.loads(resp.choices[0].message.content.strip())
         except Exception:
             try:
                 resp = groq_client.chat.completions.create(
@@ -86,6 +85,7 @@ def ask_groq_ai(prompt: str):
     raise Exception("Brak dostępnego modelu w Groq")
 
 def ask_ai_smart(prompt: str):
+    """Priorytet dla Gemini 3.8 Flash z failoverem na Groq Llama."""
     if GEMINI_API_KEY:
         client = genai.Client(api_key=GEMINI_API_KEY)
         for attempt in range(3):
@@ -105,12 +105,12 @@ def ask_ai_smart(prompt: str):
     return ask_groq_ai(prompt)
 
 def sanitize_recipe_data(raw_data: dict) -> dict:
-    """Oczyszcza składniki i kroki z halucynacji i metatekstu."""
+    """Filtruje artefakty językowe i zabezpiecza strukturę."""
     cleaned_ingredients = []
     seen = set()
     banned_words = {
         "składniki", "składnik", "ingredients", "ingredient", "żywy produkt", 
-        "żywność", "żółte krew", "krew", "makaronki"
+        "żywność", "żółte krew", "krew", "makaronki", "śmieci"
     }
 
     for item in raw_data.get("ingredients", []):
@@ -136,8 +136,7 @@ def sanitize_recipe_data(raw_data: dict) -> dict:
         s_lower = s.lower()
         if any(bad in s_lower for bad in banned_step_phrases):
             continue
-        # Naprawa niefortunnego tłumaczenia "assemble/fold" jako "złość"
-        s = re.sub(r'\bZłość\b', 'Złóż / wymieszaj', s, flags=re.IGNORECASE)
+        s = re.sub(r'\bZłość\b', 'Złóż / połącz', s, flags=re.IGNORECASE)
         if s and len(s) > 3 and s_lower not in seen_steps:
             seen_steps.add(s_lower)
             cleaned_instructions.append(s)
@@ -145,7 +144,8 @@ def sanitize_recipe_data(raw_data: dict) -> dict:
     return {
         "title": str(raw_data.get("title", "Przepis z Reels")).strip(),
         "ingredients": cleaned_ingredients,
-        "instructions": cleaned_instructions
+        "instructions": cleaned_instructions,
+        "verification_status": str(raw_data.get("verification_status", "Zweryfikowano z opisem")).strip()
     }
 
 def process_recipe_by_id(recipe_id: str, url: str):
@@ -171,6 +171,7 @@ def process_recipe_by_id(recipe_id: str, url: str):
             "progress_text": "Pobieranie audio i transkrypcja mowy (Whisper)..."
         }).eq("id", recipe_id).execute()
 
+        # Szukanie dedykowanego formatu z audio
         audio_stream_id = None
         for f in formats:
             if f.get('acodec') and f.get('acodec') != 'none':
@@ -196,12 +197,11 @@ def process_recipe_by_id(recipe_id: str, url: str):
                         media_file = downloaded_files[0]
                         groq_client = Groq(api_key=GROQ_API_KEY)
                         with open(media_file, "rb") as f:
-                            # WYMUSZENIE JĘZYKA POLSKIEGO I SŁOWNIKA KULINARNEGO
                             transcription = groq_client.audio.transcriptions.create(
                                 file=(os.path.basename(media_file), f.read()),
                                 model="whisper-large-v3",
                                 language="pl",
-                                prompt="Przepis kulinarny, składniki, proporcje, gotowanie, pieczenie, jajka, żółtka, białka, mąka, cukier, masło, smażenie."
+                                prompt="Kulinaria, gotowanie, pieczenie, składniki, gramy, łyżki, proporcje."
                             )
                         transcript_text = transcription.text.strip()
             except Exception:
@@ -211,32 +211,34 @@ def process_recipe_by_id(recipe_id: str, url: str):
 
         supabase.table("recipes").update({
             "progress_step": 3,
-            "progress_text": "Weryfikacja i scalanie przez AI...",
+            "progress_text": "Weryfikacja krzyżowa opisu i audio...",
             "transcript": transcript_text
         }).eq("id", recipe_id).execute()
 
-        # PRECYZYJNY PROMPT Z HIERARCHIĄ ŹRÓDEŁ
+        # PROTOKÓŁ WERYFIKACJI KRZYŻOWEJ I ELIMINACJI SZUMÓW
         prompt = f"""
-        Jesteś profesjonalnym polskim szefem kuchni. Twoim celem jest przygotowanie dokładnego, logicznego przepisu kulinarnego w języku polskim.
+        Przeprowadź precyzyjną weryfikację krzyżową przepisu kulinarnego w języku polskim.
 
-        DANE WEJŚCIOWE:
-        1. OPIS Z POSTA NA INSTAGRAMIE:
+        --- ŹRÓDŁO A: OPIS POSTA NA INSTAGRAMIE (Główne źródło prawdy) ---
         \"\"\"{description}\"\"\"
 
-        2. TRANSKRYPCJA AUDIO (Może zawierać błędy przez podkład muzyczny):
+        --- ŹRÓDŁO B: TRANSKRYPCJA AUDIO Z FILMU (Może zawierać szumy muzyczne i pomyłki fonetyczne) ---
         \"\"\"{transcript_text}\"\"\"
 
-        ŻELAZNE ZASADY LOGIKI:
-        1. OPIS POSTA JEST GŁÓWNYM ŹRÓDŁEM: Jeśli w opisie posta znajduje się już czytelny przepis (składniki, ilości, kroki), PRZEPISZ GO JAKO BAZĘ!
-        2. KONTROLA AUDIO: Z transkrypcji wideo wyciągaj tylko to, co ma sens kulinarny (np. dodatkowe triki, temperatury, czas smażenia). Jeśli transkrypcja zawiera dziwne, nielogiczne lub zniekształcone słowa (np. 'krew', 'śmieci', 'żywność'), CAŁKOWICIE JE ZIGNORUJ.
-        3. NATURALNA POLSZCZYZNA: Używaj właściwych czasowników kulinarnych ('oddziel białka od żółtek', 'ubij pianę', 'wymieszaj', 'smaż', 'złóż omlet'). NIGDY nie używaj słowa 'złość' ani meta-instrukcji typu 'kombinuj składniki z obu źródeł'.
-        4. JEDNOSTKI: Przelicz ewentualne uncje/cups na gramy, ml lub łyżki.
+        INSTRUKCJA WERYFIKACJI KRZYŻOWEJ:
+        1. SPRAWDZENIE OPISU: Jeśli w opisie posta podana jest lista składników z ilościami (np. 3 jajka, 200g mąki), TO JEST TWOJA GŁÓWNA BAZA SKŁADNIKÓW. Nie wolno Ci jej zniekształcać ani zastępować dziwnymi słowami z audio.
+        2. AUDYT AUDIO: Przejrzyj transkrypcję audio.
+           - Odrzuć słowa będące tekstem piosenki lub fonetycznymi błędami (np. 'żółta krew', 'śmieci', 'makaronki', 'żywność').
+           - Zachowaj z audio wyłącznie realne instrukcje kulinarne (np. 'smaż na małym ogniu przez 3 minuty', 'ubij białka na sztywną pianę', temperatura piekarnika).
+        3. SYNTEZA: Połącz składniki z Opisu z instrukcjami z Audio w czytelną listę zakupów i ponumerowane kroki.
+        4. WERYFIKACJA SPÓJNOŚCI: Upewnij się, że każdy element na liście zakupów to realny artykuł spożywczy kupowany w markecie z przypisaną sensowną kategorią (np. Nabiał, Warzywa i owoce, Sypkie i makarony, Przyprawy, Inne).
 
-        Zwróć WYŁĄCZNIE obiekt JSON w formacie:
+        Zwróć wynik jako poprawny JSON:
         {{
-            "title": "Naturalny, apetyczny tytuł dania po polsku",
+            "title": "Apetyczny tytuł dania po polsku",
+            "verification_status": "Zweryfikowano: Składniki z opisu + kroki z audio",
             "ingredients": [
-                {{"name": "Dokładna nazwa i ilość (np. 3 jajka, szczypta soli, 1 łyżka masła)", "category": "Dział w sklepie (np. Nabiał, Przyprawy, Warzywa)"}}
+                {{"name": "Dokładna nazwa i ilość produktu", "category": "Kategoria w markecie"}}
             ],
             "instructions": [
                 "Krok 1 przygotowania...",
