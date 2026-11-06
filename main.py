@@ -150,10 +150,15 @@ def process_recipe_by_id(recipe_id: str, url: str):
         transcript_text = ""
         formats = []
 
-        with yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True, 'socket_timeout': 15}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            description = info.get('description', '') or ''
-            formats = info.get('formats', []) or []
+        # Zabezpieczenie yt-dlp przed zablokowaniem (timeout 15s)
+        try:
+            with yt_dlp.YoutubeDL({'skip_download': True, 'quiet': True, 'no_warnings': True, 'socket_timeout': 15}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                description = info.get('description', '') or ''
+                formats = info.get('formats', []) or []
+        except Exception as e:
+            print(f"Błąd yt-dlp dla {url}: {e}")
+            description = "Pobrano z ograniczeniami"
 
         supabase.table("recipes").update({
             "original_description": description,
@@ -193,17 +198,19 @@ def process_recipe_by_id(recipe_id: str, url: str):
                                 prompt="Kulinaria, gotowanie, pieczenie, składniki, gramy, łyżki, proporcje."
                             )
                         transcript_text = transcription.text.strip()
-            except Exception:
-                transcript_text = "(Nie wykryto mowy w filmie)"
+            except Exception as ex:
+                print(f"Błąd Whisper: {ex}")
+                transcript_text = "(Błąd transkrypcji audio)"
         else:
             transcript_text = "(Rolka bez ścieżki dźwiękowej)"
 
         supabase.table("recipes").update({
             "progress_step": 3,
-            "progress_text": "Analiza treści przez Gemini...",
+            "progress_text": "Analiza treści przez Gemini (oczekiwanie na limit)...",
             "transcript": transcript_text
         }).eq("id", recipe_id).execute()
 
+        # Tutaj wywołujemy bezpieczne AI z obsługą ponawiania
         raw_recipe = ask_ai_structured(description, transcript_text)
         recipe_data = sanitize_recipe_data(raw_recipe, fallback_description=description)
 
@@ -219,7 +226,7 @@ def process_recipe_by_id(recipe_id: str, url: str):
         }).eq("id", recipe_id).execute()
 
     except Exception as err:
-        print(f"Błąd dla przepisu {recipe_id}: {err}")
+        print(f"KRYTYCZNY BŁĄD dla przepisu {recipe_id}: {err}")
         if supabase:
             supabase.table("recipes").update({
                 "status": "error",
