@@ -26,7 +26,7 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def ask_groq_ai(prompt: str):
-    """Zapasowy silnik AI z automatycznym doborem modeli i bezpieczną temperaturą."""
+    """Zapasowy silnik AI z filtrem modeli i precyzyjnym system promptem."""
     groq_client = Groq(api_key=GROQ_API_KEY)
     
     active_models = []
@@ -46,15 +46,18 @@ def ask_groq_ai(prompt: str):
 
     active_models.sort(key=lambda name: 0 if "llama-3.1-8b" in name else (1 if "llama-3.3" in name else 2))
 
+    system_instruction = (
+        "Jesteś profesjonalnym polskim szefem kuchni. Twoim zadaniem jest przygotowanie "
+        "poprawnego, w 100% logicznego przepisu kulinarnego w języku polskim. "
+        "Zwracasz WYŁĄCZNIE czysty JSON. Ignorujesz nielogiczne szumy z transkrypcji audio."
+    )
+
     for model_name in active_models:
         try:
             resp = groq_client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "Jesteś kucharzem i tłumaczem. Zwracasz WYŁĄCZNIE poprawny JSON bez żadnego dodatkowego tekstu."
-                    },
+                    {"role": "system", "content": system_instruction},
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
@@ -68,10 +71,7 @@ def ask_groq_ai(prompt: str):
                 resp = groq_client.chat.completions.create(
                     model=model_name,
                     messages=[
-                        {
-                            "role": "system",
-                            "content": "Zwróć przepis jako obiekt JSON: {\"title\": \"...\", \"ingredients\": [{\"name\": \"...\", \"category\": \"...\"}], \"instructions\": [\"...\"]}."
-                        },
+                        {"role": "system", "content": system_instruction},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.1,
@@ -105,10 +105,13 @@ def ask_ai_smart(prompt: str):
     return ask_groq_ai(prompt)
 
 def sanitize_recipe_data(raw_data: dict) -> dict:
-    """Filtruje zduplikowane i zapętlone składniki (np. powtarzające się słowo 'składniki')."""
+    """Oczyszcza składniki i kroki z halucynacji i metatekstu."""
     cleaned_ingredients = []
     seen = set()
-    banned_words = {"składniki", "składnik", "ingredients", "ingredient", "żywy produkt"}
+    banned_words = {
+        "składniki", "składnik", "ingredients", "ingredient", "żywy produkt", 
+        "żywność", "żółte krew", "krew", "makaronki"
+    }
 
     for item in raw_data.get("ingredients", []):
         if isinstance(item, dict):
@@ -126,10 +129,17 @@ def sanitize_recipe_data(raw_data: dict) -> dict:
 
     cleaned_instructions = []
     seen_steps = set()
+    banned_step_phrases = ["kombinuj składniki", "z obu źródeł", "krew", "śmieci"]
+
     for step in raw_data.get("instructions", []):
         s = str(step).strip()
-        if s and len(s) > 2 and s.lower() not in seen_steps:
-            seen_steps.add(s.lower())
+        s_lower = s.lower()
+        if any(bad in s_lower for bad in banned_step_phrases):
+            continue
+        # Naprawa niefortunnego tłumaczenia "assemble/fold" jako "złość"
+        s = re.sub(r'\bZłość\b', 'Złóż / wymieszaj', s, flags=re.IGNORECASE)
+        if s and len(s) > 3 and s_lower not in seen_steps:
+            seen_steps.add(s_lower)
             cleaned_instructions.append(s)
 
     return {
@@ -186,9 +196,12 @@ def process_recipe_by_id(recipe_id: str, url: str):
                         media_file = downloaded_files[0]
                         groq_client = Groq(api_key=GROQ_API_KEY)
                         with open(media_file, "rb") as f:
+                            # WYMUSZENIE JĘZYKA POLSKIEGO I SŁOWNIKA KULINARNEGO
                             transcription = groq_client.audio.transcriptions.create(
                                 file=(os.path.basename(media_file), f.read()),
-                                model="whisper-large-v3"
+                                model="whisper-large-v3",
+                                language="pl",
+                                prompt="Przepis kulinarny, składniki, proporcje, gotowanie, pieczenie, jajka, żółtka, białka, mąka, cukier, masło, smażenie."
                             )
                         transcript_text = transcription.text.strip()
             except Exception:
@@ -198,27 +211,37 @@ def process_recipe_by_id(recipe_id: str, url: str):
 
         supabase.table("recipes").update({
             "progress_step": 3,
-            "progress_text": "Scalanie opisu i transkrypcji przez AI...",
+            "progress_text": "Weryfikacja i scalanie przez AI...",
             "transcript": transcript_text
         }).eq("id", recipe_id).execute()
 
+        # PRECYZYJNY PROMPT Z HIERARCHIĄ ŹRÓDEŁ
         prompt = f"""
-        Stwórz kompletny, zwięzły przepis kulinarny w języku polskim:
+        Jesteś profesjonalnym polskim szefem kuchni. Twoim celem jest przygotowanie dokładnego, logicznego przepisu kulinarnego w języku polskim.
 
-        ŹRÓDŁO 1 (Opis pod postem):
+        DANE WEJŚCIOWE:
+        1. OPIS Z POSTA NA INSTAGRAMIE:
         \"\"\"{description}\"\"\"
 
-        ŹRÓDŁO 2 (Transkrypcja nagrania):
+        2. TRANSKRYPCJA AUDIO (Może zawierać błędy przez podkład muzyczny):
         \"\"\"{transcript_text}\"\"\"
 
-        Wytyczne:
-        - Połącz składniki z obu źródeł w spójną całość. Jeśli nie ma mowy, bazuj w 100% na opisie posta.
-        - Przelicz jednostki (uncje/cups na gramy, ml, łyżki).
-        - Zwróć WYŁĄCZNIE poprawny JSON:
+        ŻELAZNE ZASADY LOGIKI:
+        1. OPIS POSTA JEST GŁÓWNYM ŹRÓDŁEM: Jeśli w opisie posta znajduje się już czytelny przepis (składniki, ilości, kroki), PRZEPISZ GO JAKO BAZĘ!
+        2. KONTROLA AUDIO: Z transkrypcji wideo wyciągaj tylko to, co ma sens kulinarny (np. dodatkowe triki, temperatury, czas smażenia). Jeśli transkrypcja zawiera dziwne, nielogiczne lub zniekształcone słowa (np. 'krew', 'śmieci', 'żywność'), CAŁKOWICIE JE ZIGNORUJ.
+        3. NATURALNA POLSZCZYZNA: Używaj właściwych czasowników kulinarnych ('oddziel białka od żółtek', 'ubij pianę', 'wymieszaj', 'smaż', 'złóż omlet'). NIGDY nie używaj słowa 'złość' ani meta-instrukcji typu 'kombinuj składniki z obu źródeł'.
+        4. JEDNOSTKI: Przelicz ewentualne uncje/cups na gramy, ml lub łyżki.
+
+        Zwróć WYŁĄCZNIE obiekt JSON w formacie:
         {{
-            "title": "Dokładny tytuł dania po polsku",
-            "ingredients": [{{"name": "nazwa i ilość produktu", "category": "dział w sklepie"}}],
-            "instructions": ["Krok 1", "Krok 2"]
+            "title": "Naturalny, apetyczny tytuł dania po polsku",
+            "ingredients": [
+                {{"name": "Dokładna nazwa i ilość (np. 3 jajka, szczypta soli, 1 łyżka masła)", "category": "Dział w sklepie (np. Nabiał, Przyprawy, Warzywa)"}}
+            ],
+            "instructions": [
+                "Krok 1 przygotowania...",
+                "Krok 2 przygotowania..."
+            ]
         }}
         """
 
@@ -277,7 +300,6 @@ def edit_recipe(
     ingredients_text: str = Form(...),
     instructions_text: str = Form(...)
 ):
-    """Ręczna edycja tytułu, składników i instrukcji w Supabase."""
     if not supabase:
         return JSONResponse(status_code=500, content={"message": "Brak bazy"})
 
