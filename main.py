@@ -26,17 +26,16 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def ask_groq_ai(prompt: str):
-    """Zapasowy silnik AI pobierający wyłącznie aktywne modele z konta Groq."""
+    """Zapasowy silnik AI z automatycznym doborem modeli i bezpieczną temperaturą."""
     groq_client = Groq(api_key=GROQ_API_KEY)
     
-    # 1. Pobranie aktualnie aktywnych modeli tekstowych
     active_models = []
     try:
         models_data = groq_client.models.list().data
         for m in models_data:
             mid = m.id.lower()
             is_active = getattr(m, 'active', True)
-            is_specialized = any(x in mid for x in ["whisper", "guard", "orpheus", "embed", "tts", "vision", "safetensors"])
+            is_specialized = any(x in mid for x in ["whisper", "guard", "orpheus", "embed", "tts", "vision"])
             if is_active and not is_specialized and "/" not in m.id:
                 active_models.append(m.id)
     except Exception as e:
@@ -45,13 +44,10 @@ def ask_groq_ai(prompt: str):
     if not active_models:
         active_models = ["llama-3.1-8b-instant"]
 
-    # Priorytetyzacja sprawdzonych modeli Llama
     active_models.sort(key=lambda name: 0 if "llama-3.1-8b" in name else (1 if "llama-3.3" in name else 2))
 
     for model_name in active_models:
-        # Próba 1: Tryb wymuszonego JSON
         try:
-            print(f"Uruchamiam model Groq: {model_name}")
             resp = groq_client.chat.completions.create(
                 model=model_name,
                 messages=[
@@ -67,10 +63,7 @@ def ask_groq_ai(prompt: str):
             )
             raw = resp.choices[0].message.content.strip()
             return json.loads(raw)
-        except Exception as e1:
-            print(f"Model {model_name} (JSON mode) błąd: {e1}. Próba w trybie swobodnym...")
-            
-            # Próba 2: Tryb swobodny z ekstrakcją klamer regexem
+        except Exception:
             try:
                 resp = groq_client.chat.completions.create(
                     model=model_name,
@@ -84,18 +77,15 @@ def ask_groq_ai(prompt: str):
                     temperature=0.1,
                     max_tokens=2048
                 )
-                raw_text = resp.choices[0].message.content.strip()
-                match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                match = re.search(r'\{.*\}', resp.choices[0].message.content.strip(), re.DOTALL)
                 if match:
                     return json.loads(match.group(0))
-            except Exception as e2:
-                print(f"Model {model_name} (tekst) błąd: {e2}")
+            except Exception:
                 continue
 
-    raise Exception("Żaden z aktywnych modeli Groq nie przetworzył zapytania.")
+    raise Exception("Brak dostępnego modelu w Groq")
 
 def ask_ai_smart(prompt: str):
-    """Odpytuje Gemini (z ponawianiem przy 503), a w razie braku limitu przełącza na Groq."""
     if GEMINI_API_KEY:
         client = genai.Client(api_key=GEMINI_API_KEY)
         for attempt in range(3):
@@ -109,17 +99,47 @@ def ask_ai_smart(prompt: str):
             except Exception as e:
                 err_msg = str(e)
                 if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < 2:
-                    print(f"[Gemini 503] Ponawiam próbę za 3s ({attempt+1}/3)...")
                     time.sleep(3)
                     continue
-                print(f"[Gemini błąd/limit]: {err_msg[:90]}. Przełączam na Groq...")
                 break
-
     return ask_groq_ai(prompt)
+
+def sanitize_recipe_data(raw_data: dict) -> dict:
+    """Filtruje zduplikowane i zapętlone składniki (np. powtarzające się słowo 'składniki')."""
+    cleaned_ingredients = []
+    seen = set()
+    banned_words = {"składniki", "składnik", "ingredients", "ingredient", "żywy produkt"}
+
+    for item in raw_data.get("ingredients", []):
+        if isinstance(item, dict):
+            name = str(item.get("name", "")).strip()
+            cat = str(item.get("category", "Inne")).strip() or "Inne"
+        else:
+            name = str(item).strip()
+            cat = "Inne"
+
+        name_lower = name.lower()
+        if not name or len(name) < 2 or name_lower in banned_words or name_lower in seen:
+            continue
+        seen.add(name_lower)
+        cleaned_ingredients.append({"name": name, "category": cat})
+
+    cleaned_instructions = []
+    seen_steps = set()
+    for step in raw_data.get("instructions", []):
+        s = str(step).strip()
+        if s and len(s) > 2 and s.lower() not in seen_steps:
+            seen_steps.add(s.lower())
+            cleaned_instructions.append(s)
+
+    return {
+        "title": str(raw_data.get("title", "Przepis z Reels")).strip(),
+        "ingredients": cleaned_ingredients,
+        "instructions": cleaned_instructions
+    }
 
 def process_recipe_by_id(recipe_id: str, url: str):
     try:
-        # KROK 1: Pobranie opisu i formatów
         supabase.table("recipes").update({
             "status": "processing",
             "progress_step": 1,
@@ -141,7 +161,6 @@ def process_recipe_by_id(recipe_id: str, url: str):
             "progress_text": "Pobieranie audio i transkrypcja mowy (Whisper)..."
         }).eq("id", recipe_id).execute()
 
-        # KROK 2: Weryfikacja obecności ścieżki dźwiękowej
         audio_stream_id = None
         for f in formats:
             if f.get('acodec') and f.get('acodec') != 'none':
@@ -172,14 +191,11 @@ def process_recipe_by_id(recipe_id: str, url: str):
                                 model="whisper-large-v3"
                             )
                         transcript_text = transcription.text.strip()
-                        print(f"Transkrypcja Whisper gotowa ({len(transcript_text)} znaków)")
-            except Exception as audio_err:
-                print(f"Transkrypcja pominięta: {audio_err}")
+            except Exception:
                 transcript_text = "(Nie wykryto mowy w filmie)"
         else:
             transcript_text = "(Rolka bez ścieżki dźwiękowej)"
 
-        # KROK 3: Przetworzenie całości przez AI
         supabase.table("recipes").update({
             "progress_step": 3,
             "progress_text": "Scalanie opisu i transkrypcji przez AI...",
@@ -187,32 +203,32 @@ def process_recipe_by_id(recipe_id: str, url: str):
         }).eq("id", recipe_id).execute()
 
         prompt = f"""
-        Stwórz kompletny, zwięzły przepis kulinarny w języku polskim na podstawie danych:
+        Stwórz kompletny, zwięzły przepis kulinarny w języku polskim:
 
-        ŹRÓDŁO 1 (Opis posta na Instagramie):
+        ŹRÓDŁO 1 (Opis pod postem):
         \"\"\"{description}\"\"\"
 
-        ŹRÓDŁO 2 (Mowa twórcy z nagrania):
+        ŹRÓDŁO 2 (Transkrypcja nagrania):
         \"\"\"{transcript_text}\"\"\"
 
         Wytyczne:
-        - Połącz składniki i proporcje z obu źródeł w spójną całość.
-        - Przetłumacz na polski i przelicz jednostki (uncje, cup na gramy/ml/łyżki).
-        - Zwróć wyłącznie JSON o strukturze:
+        - Połącz składniki z obu źródeł w spójną całość. Jeśli nie ma mowy, bazuj w 100% na opisie posta.
+        - Przelicz jednostki (uncje/cups na gramy, ml, łyżki).
+        - Zwróć WYŁĄCZNIE poprawny JSON:
         {{
             "title": "Dokładny tytuł dania po polsku",
             "ingredients": [{{"name": "nazwa i ilość produktu", "category": "dział w sklepie"}}],
-            "instructions": ["Krok 1 przygotowania", "Krok 2 przygotowania"]
+            "instructions": ["Krok 1", "Krok 2"]
         }}
         """
 
-        recipe_data = ask_ai_smart(prompt)
+        raw_recipe = ask_ai_smart(prompt)
+        recipe_data = sanitize_recipe_data(raw_recipe)
 
-        # KROK 4: Zapis do Supabase
         supabase.table("recipes").update({
-            "title": recipe_data.get("title", "Przepis z Reels"),
-            "ingredients": recipe_data.get("ingredients", []),
-            "instructions": recipe_data.get("instructions", []),
+            "title": recipe_data["title"],
+            "ingredients": recipe_data["ingredients"],
+            "instructions": recipe_data["instructions"],
             "status": "completed",
             "progress_step": 4,
             "progress_text": "Ukończono!",
@@ -253,6 +269,45 @@ def get_recipes_count():
         res = supabase.table("recipes").select("id", count="exact").eq("status", "completed").execute()
         return {"count": res.count or 0}
     return {"count": 0}
+
+@app.post("/edit/{recipe_id}")
+def edit_recipe(
+    recipe_id: str,
+    title: str = Form(...),
+    ingredients_text: str = Form(...),
+    instructions_text: str = Form(...)
+):
+    """Ręczna edycja tytułu, składników i instrukcji w Supabase."""
+    if not supabase:
+        return JSONResponse(status_code=500, content={"message": "Brak bazy"})
+
+    ingredients = []
+    for line in ingredients_text.strip().split("\n"):
+        line = line.strip().lstrip("-*•0123456789. ")
+        if not line:
+            continue
+        cat = "Inne"
+        match = re.search(r'\[(.*?)\]', line)
+        if match:
+            cat = match.group(1).strip()
+            line = re.sub(r'\[.*?\]', '', line).strip()
+        ingredients.append({"name": line, "category": cat})
+
+    instructions = [
+        line.strip().lstrip("-*•0123456789. ")
+        for line in instructions_text.strip().split("\n")
+        if line.strip()
+    ]
+
+    try:
+        supabase.table("recipes").update({
+            "title": title.strip(),
+            "ingredients": ingredients,
+            "instructions": instructions
+        }).eq("id", recipe_id).execute()
+        return {"status": "success"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"message": str(e)})
 
 @app.post("/process")
 def process_reels(background_tasks: BackgroundTasks, url: str = Form(...)):
