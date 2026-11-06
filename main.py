@@ -26,7 +26,6 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def ask_groq_ai(prompt: str):
-    """Zapasowy silnik AI z automatycznym wyborem modelu i bezpieczną temperaturą."""
     groq_client = Groq(api_key=GROQ_API_KEY)
     
     active_models = []
@@ -47,9 +46,9 @@ def ask_groq_ai(prompt: str):
     active_models.sort(key=lambda name: 0 if "llama-3.1-8b" in name else (1 if "llama-3.3" in name else 2))
 
     system_instruction = (
-        "Jesteś precyzyjnym weryfikatorem kulinarnym. "
-        "Twoim zadaniem jest stworzyć w 100% logiczny przepis w języku polskim. "
-        "Zwracasz WYŁĄCZNIE czysty JSON bez komentarzy."
+        "Jesteś precyzyjnym asystentem kulinarnym. Twoim jedynym celem jest wyodrębnienie "
+        "rzeczywistych składników i instrukcji z tekstu użytkownika. "
+        "Zwracasz czysty JSON. Nigdy nie kopiujesz nazw pól ani słów kluczowych jako wartości."
     )
 
     for model_name in active_models:
@@ -85,7 +84,6 @@ def ask_groq_ai(prompt: str):
     raise Exception("Brak dostępnego modelu w Groq")
 
 def ask_ai_smart(prompt: str):
-    """Priorytet dla Gemini 3.8 Flash z failoverem na Groq Llama."""
     if GEMINI_API_KEY:
         client = genai.Client(api_key=GEMINI_API_KEY)
         for attempt in range(3):
@@ -104,14 +102,24 @@ def ask_ai_smart(prompt: str):
                 break
     return ask_groq_ai(prompt)
 
-def sanitize_recipe_data(raw_data: dict) -> dict:
-    """Filtruje artefakty językowe i zabezpiecza strukturę."""
+def sanitize_recipe_data(raw_data: dict, fallback_description: str = "") -> dict:
+    """Weryfikuje, czy AI nie zwróciło zaślepek z szablonu, i oczyszcza dane."""
+    raw_title = str(raw_data.get("title", "")).strip()
+    
+    # Blokada kopiowania zaślepek tytułu
+    if not raw_title or "apetyczny tytuł" in raw_title.lower() or "przepis z reels" in raw_title.lower():
+        # Pobieramy pierwszą sensowną linijkę z opisu jako tytuł
+        lines = [l.strip() for l in fallback_description.split("\n") if len(l.strip()) > 3]
+        raw_title = lines[0][:60] if lines else "Przepis z Instagrama"
+
+    dummy_phrases = [
+        "dokładna nazwa", "kategoria w markecie", "ilość produktu", 
+        "przygotowanie...", "krok 1:", "krok 2:", "kombinuj składniki", "żywy produkt"
+    ]
+
     cleaned_ingredients = []
     seen = set()
-    banned_words = {
-        "składniki", "składnik", "ingredients", "ingredient", "żywy produkt", 
-        "żywność", "żółte krew", "krew", "makaronki", "śmieci"
-    }
+    banned_words = {"składniki", "składnik", "ingredients", "ingredient", "żywność", "krew", "śmieci"}
 
     for item in raw_data.get("ingredients", []):
         if isinstance(item, dict):
@@ -122,6 +130,9 @@ def sanitize_recipe_data(raw_data: dict) -> dict:
             cat = "Inne"
 
         name_lower = name.lower()
+        # Wykrycie i odrzucenie przekopiowanej zaślepki
+        if any(d in name_lower for d in dummy_phrases):
+            continue
         if not name or len(name) < 2 or name_lower in banned_words or name_lower in seen:
             continue
         seen.add(name_lower)
@@ -129,23 +140,32 @@ def sanitize_recipe_data(raw_data: dict) -> dict:
 
     cleaned_instructions = []
     seen_steps = set()
-    banned_step_phrases = ["kombinuj składniki", "z obu źródeł", "krew", "śmieci"]
 
     for step in raw_data.get("instructions", []):
         s = str(step).strip()
         s_lower = s.lower()
-        if any(bad in s_lower for bad in banned_step_phrases):
+        if any(d in s_lower for d in dummy_phrases):
             continue
-        s = re.sub(r'\bZłość\b', 'Złóż / połącz', s, flags=re.IGNORECASE)
+        s = re.sub(r'\bZłość\b', 'Złóż / wymieszaj', s, flags=re.IGNORECASE)
         if s and len(s) > 3 and s_lower not in seen_steps:
             seen_steps.add(s_lower)
             cleaned_instructions.append(s)
 
+    # Awaryjne wyciąganie z opisu posta, gdy model zawiedzie na całej linii
+    if not cleaned_ingredients and fallback_description:
+        desc_lines = [l.strip() for l in fallback_description.split("\n") if l.strip()]
+        for l in desc_lines:
+            if any(char in l for char in ["-", "•", "*", "g ", "ml", "łyż", "szt"]):
+                cleaned_ingredients.append({"name": l.lstrip("-•* "), "category": "Produkty"})
+
+    if not cleaned_instructions and fallback_description:
+        desc_lines = [l.strip() for l in fallback_description.split("\n") if len(l.strip()) > 15]
+        cleaned_instructions = desc_lines[:8]
+
     return {
-        "title": str(raw_data.get("title", "Przepis z Reels")).strip(),
+        "title": raw_title,
         "ingredients": cleaned_ingredients,
-        "instructions": cleaned_instructions,
-        "verification_status": str(raw_data.get("verification_status", "Zweryfikowano z opisem")).strip()
+        "instructions": cleaned_instructions
     }
 
 def process_recipe_by_id(recipe_id: str, url: str):
@@ -171,7 +191,6 @@ def process_recipe_by_id(recipe_id: str, url: str):
             "progress_text": "Pobieranie audio i transkrypcja mowy (Whisper)..."
         }).eq("id", recipe_id).execute()
 
-        # Szukanie dedykowanego formatu z audio
         audio_stream_id = None
         for f in formats:
             if f.get('acodec') and f.get('acodec') != 'none':
@@ -215,40 +234,37 @@ def process_recipe_by_id(recipe_id: str, url: str):
             "transcript": transcript_text
         }).eq("id", recipe_id).execute()
 
-        # PROTOKÓŁ WERYFIKACJI KRZYŻOWEJ I ELIMINACJI SZUMÓW
+        # BEZPIECZNY PROMPT BEZ TEKSTOWYCH ZAŚLEPEK DO SKOPIOWANIA
         prompt = f"""
-        Przeprowadź precyzyjną weryfikację krzyżową przepisu kulinarnego w języku polskim.
+        Przeanalizuj poniższe materiały kulinarne i wyciągnij z nich faktyczny przepis:
 
-        --- ŹRÓDŁO A: OPIS POSTA NA INSTAGRAMIE (Główne źródło prawdy) ---
+        TEKST Z OPISU POSTA:
         \"\"\"{description}\"\"\"
 
-        --- ŹRÓDŁO B: TRANSKRYPCJA AUDIO Z FILMU (Może zawierać szumy muzyczne i pomyłki fonetyczne) ---
+        TRANSKRYPCJA AUDIO:
         \"\"\"{transcript_text}\"\"\"
 
-        INSTRUKCJA WERYFIKACJI KRZYŻOWEJ:
-        1. SPRAWDZENIE OPISU: Jeśli w opisie posta podana jest lista składników z ilościami (np. 3 jajka, 200g mąki), TO JEST TWOJA GŁÓWNA BAZA SKŁADNIKÓW. Nie wolno Ci jej zniekształcać ani zastępować dziwnymi słowami z audio.
-        2. AUDYT AUDIO: Przejrzyj transkrypcję audio.
-           - Odrzuć słowa będące tekstem piosenki lub fonetycznymi błędami (np. 'żółta krew', 'śmieci', 'makaronki', 'żywność').
-           - Zachowaj z audio wyłącznie realne instrukcje kulinarne (np. 'smaż na małym ogniu przez 3 minuty', 'ubij białka na sztywną pianę', temperatura piekarnika).
-        3. SYNTEZA: Połącz składniki z Opisu z instrukcjami z Audio w czytelną listę zakupów i ponumerowane kroki.
-        4. WERYFIKACJA SPÓJNOŚCI: Upewnij się, że każdy element na liście zakupów to realny artykuł spożywczy kupowany w markecie z przypisaną sensowną kategorią (np. Nabiał, Warzywa i owoce, Sypkie i makarony, Przyprawy, Inne).
+        ZASADY:
+        1. Jeśli w tekście opisu znajdują się składniki i proporcje, wyciągnij je dokładnie.
+        2. Odrzuć z audio wszelkie nielogiczne słowa, teksty piosenek lub szumy.
+        3. Do każdego składnika dopasuj kategorię (np. Nabiał, Warzywa i owoce, Sypkie, Mięso, Przyprawy, Inne).
+        4. Rozpisz kolejne czynności przygotowania na czytelne punkty.
 
-        Zwróć wynik jako poprawny JSON:
+        ZWRÓĆ WYŁĄCZNIE CZYSTY OBIEKT JSON W TYM FORMACIE:
         {{
-            "title": "Apetyczny tytuł dania po polsku",
-            "verification_status": "Zweryfikowano: Składniki z opisu + kroki z audio",
+            "title": "nazwa potrawy ustalona na podstawie tekstu",
             "ingredients": [
-                {{"name": "Dokładna nazwa i ilość produktu", "category": "Kategoria w markecie"}}
+                {{"name": "nazwa produktu z gramaturą lub ilością", "category": "dział sklepu"}}
             ],
             "instructions": [
-                "Krok 1 przygotowania...",
-                "Krok 2 przygotowania..."
+                "opis pierwszej czynności",
+                "opis drugiej czynności"
             ]
         }}
         """
 
         raw_recipe = ask_ai_smart(prompt)
-        recipe_data = sanitize_recipe_data(raw_recipe)
+        recipe_data = sanitize_recipe_data(raw_recipe, fallback_description=description)
 
         supabase.table("recipes").update({
             "title": recipe_data["title"],
