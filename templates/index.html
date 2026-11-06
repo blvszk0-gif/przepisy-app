@@ -141,11 +141,10 @@
                             <span class="px-2.5 py-0.5 rounded-full bg-zinc-800 border border-zinc-700/50 text-zinc-300">
                                 🛒 {{ recipe.ingredients | length }} składników
                             </span>
-                            <span class="px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">
-                                🎙️ Audio + Opis
+                            <span class="px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium flex items-center gap-1">
+                                <span>🛡️</span> Zweryfikowano z opisem
                             </span>
                         </div>
-                    </div>
 
                     <script type="application/json" id="recipe-data-{{ recipe.id }}">
                         {{ recipe | tojson }}
